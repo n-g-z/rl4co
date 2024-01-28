@@ -37,9 +37,13 @@ class CVRPTWEnv(CVRPEnv):
     def _make_spec(self, td_params: TensorDict):
         super()._make_spec(td_params)
 
-        current_time = UnboundedContinuousTensorSpec(shape=(1), dtype=torch.float32, device=self.device)
+        current_time = UnboundedContinuousTensorSpec(
+            shape=(1), dtype=torch.float32, device=self.device
+        )
 
-        current_loc = UnboundedContinuousTensorSpec(shape=(2), dtype=torch.float32, device=self.device)
+        current_loc = UnboundedContinuousTensorSpec(
+            shape=(2), dtype=torch.float32, device=self.device
+        )
 
         durations = BoundedTensorSpec(
             low=self.min_time,
@@ -61,6 +65,12 @@ class CVRPTWEnv(CVRPEnv):
         )
 
         # extend observation specs
+        print("\n## self.device:\n", self.device)
+        print("\n## self.observation_spec:\n", self.observation_spec)
+        print("\n## current_time:\n", current_time)
+        print("\n## current_loc:\n", current_loc)
+        print("\n## durations:\n", durations)
+        print("\n## time_windows:\n", time_windows)
         self.observation_spec = CompositeSpec(
             **self.observation_spec,
             current_time=current_time,
