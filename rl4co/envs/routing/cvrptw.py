@@ -8,7 +8,6 @@ from torchrl.data import (
     UnboundedContinuousTensorSpec,
     UnboundedDiscreteTensorSpec,
 )
-from zmq import device
 
 from rl4co.envs.routing.cvrp import CVRPEnv, CAPACITIES
 from rl4co.utils.ops import gather_by_index, get_distance, get_tour_length
