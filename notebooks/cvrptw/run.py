@@ -18,7 +18,7 @@ device_str = (
 device = torch.device(device_str)
 
 # batch size
-batch_size = 3
+batch_size = 128
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -31,6 +31,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     ### --- environment --- ###
+    print("Define environment")
     env = CVRPTWEnv(
         num_loc=args.num_loc,
         min_loc=0,
@@ -46,6 +47,7 @@ if __name__ == "__main__":
     )
 
     ### --- random policy --- ###
+    print("Start random policy")
     reward, td, actions = rollout(
         env=env,
         td=env.reset(batch_size=[batch_size]).to(device),
@@ -83,7 +85,7 @@ if __name__ == "__main__":
     wandb.login()
     logger = WandbLogger(
         project="routefinder",
-        name=f"cvrptw-am_{date_time_str}",
+        name=f"cvrptw-am_n{args.num_loc}_e{args.epochs}_{date_time_str}",
     )
 
     ### --- Training --- ###
