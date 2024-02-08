@@ -9,27 +9,13 @@ from rl4co.utils.trainer import RL4COTrainer
 device_str = (
     "cuda"
     if torch.cuda.is_available()
-    else "mps"
-    if (torch.backends.mps.is_available() and torch.backends.mps.is_built())
-    else "cpu"
+    else (
+        "mps"
+        if (torch.backends.mps.is_available() and torch.backends.mps.is_built())
+        else "cpu"
+    )
 )
 device = torch.device(device_str)
-
-env_cvrptw = CVRPTWEnv(
-    num_loc=30,
-    min_loc=0,
-    max_loc=150,
-    min_demand=1,
-    max_demand=10,
-    vehicle_capacity=1,
-    capacity=10,
-    min_time=0,
-    max_time=480,
-    scale=True,
-    device=device_str,
-)
-
-env = env_cvrptw
 
 # batch size
 batch_size = 3
@@ -39,7 +25,25 @@ if __name__ == "__main__":
     parser.add_argument(
         "--epochs", help="Number of epochs to train for", type=int, default=3
     )
+    parser.add_argument(
+        "--num_loc", help="Number of epochs to train for", type=int, default=30
+    )
     args = parser.parse_args()
+
+    ### --- environment --- ###
+    env = CVRPTWEnv(
+        num_loc=args.num_loc,
+        min_loc=0,
+        max_loc=150,
+        min_demand=1,
+        max_demand=10,
+        vehicle_capacity=1,
+        capacity=10,
+        min_time=0,
+        max_time=480,
+        scale=True,
+        device=device_str,
+    )
 
     ### --- random policy --- ###
     reward, td, actions = rollout(
@@ -74,7 +78,7 @@ if __name__ == "__main__":
     import wandb
     from lightning.pytorch.loggers import WandbLogger
 
-    date_time_str = datetime.now().strftime("%Y/%m/%d_%H:%M:%S")
+    date_time_str = datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
 
     wandb.login()
     logger = WandbLogger(
@@ -98,4 +102,6 @@ if __name__ == "__main__":
     trainer.test(model)
 
     ### --- Saving --- ###
-    trainer.save_checkpoint(f"data/cvrptw_{date_time_str}.ckpt")
+    trainer.save_checkpoint(
+        f"data/cvrptw/n{args.num_loc}_e{args.epochs}_{date_time_str}.ckpt"
+    )
