@@ -275,20 +275,24 @@ class CVRPEnv(RL4COEnvBase):
                 maximum=self.max_loc,
                 shape=(self.num_loc + 1, 2),
                 dtype=torch.float32,
+                device=self.device,
             ),
             current_node=UnboundedDiscreteTensorSpec(
                 shape=(1),
                 dtype=torch.int64,
+                device=self.device,
             ),
             demand=BoundedTensorSpec(
                 minimum=-self.capacity,
                 maximum=self.max_demand,
                 shape=(self.num_loc, 1),  # demand is only for customers
                 dtype=torch.float32,
+                device=self.device,
             ),
             action_mask=UnboundedDiscreteTensorSpec(
                 shape=(self.num_loc + 1, 1),
                 dtype=torch.bool,
+                device=self.device,
             ),
             shape=(),
         )
@@ -297,9 +301,12 @@ class CVRPEnv(RL4COEnvBase):
             dtype=torch.int64,
             minimum=0,
             maximum=self.num_loc + 1,
+            device=self.device,
         )
-        self.reward_spec = UnboundedContinuousTensorSpec(shape=(1,))
-        self.done_spec = UnboundedDiscreteTensorSpec(shape=(1,), dtype=torch.bool)
+        self.reward_spec = UnboundedContinuousTensorSpec(shape=(1,), device=self.device)
+        self.done_spec = UnboundedDiscreteTensorSpec(
+            shape=(1,), dtype=torch.bool, device=self.device
+        )
 
     @staticmethod
     def render(
