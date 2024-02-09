@@ -17,9 +17,6 @@ device_str = (
 )
 device = torch.device(device_str)
 
-# batch size
-batch_size = 128
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -27,6 +24,9 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--num_loc", help="Number of epochs to train for", type=int, default=30
+    )
+    parser.add_argument(
+        "--batch_size", help="Number of epochs to train for", type=int, default=3
     )
     args = parser.parse_args()
 
@@ -50,11 +50,11 @@ if __name__ == "__main__":
     print("Start random policy")
     reward, td, actions = rollout(
         env=env,
-        td=env.reset(batch_size=[batch_size]).to(device),
+        td=env.reset(batch_size=[args.batch_size]).to(device),
         policy=random_policy,
         max_steps=1000,
     )
-    assert reward.shape == (batch_size,)
+    assert reward.shape == (args.batch_size,)
 
     env.get_reward(td, actions)
     CVRPTWEnv.check_solution_validity(td, actions)
@@ -71,7 +71,7 @@ if __name__ == "__main__":
     )
 
     # Greedy rollouts over untrained model
-    td_init = env.reset(batch_size=[3]).to(device)
+    td_init = env.reset(batch_size=[args.batch_size]).to(device)
     model = model.to(device)
     out = model(td_init.clone(), phase="test", decode_type="greedy", return_actions=True)
 
