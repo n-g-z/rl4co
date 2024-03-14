@@ -28,10 +28,14 @@ def check_extension(filename, extension=".npz"):
 
 
 def load_solomon_instance(name, path=None, edge_weights=False):
-    """Load a solomon instance from a file"""
+    """Load solomon instance from a file"""
+    import vrplib
+
     if not path:
         path = "data/solomon/instances/"
         path = os.path.join(ROOT_PATH, path)
+    if not os.path.isdir(path):
+        os.makedirs(path)
     file_path = f"{path}{name}.txt"
     if not os.path.isfile(file_path):
         vrplib.download_instance(name=name, path=path)
@@ -43,9 +47,14 @@ def load_solomon_instance(name, path=None, edge_weights=False):
 
 
 def load_solomon_solution(name, path=None):
+    """Load solomon solution from a file"""
+    import vrplib
+
     if not path:
         path = "data/solomon/solutions/"
         path = os.path.join(ROOT_PATH, path)
+    if not os.path.isdir(path):
+        os.makedirs(path)
     file_path = f"{path}{name}.sol"
     if not os.path.isfile(file_path):
         vrplib.download_solution(name=name, path=path)
