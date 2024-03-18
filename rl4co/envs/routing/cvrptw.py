@@ -42,12 +42,18 @@ class CVRPTWEnv(CVRPEnv):
         max_loc: float = 150,  # different default value to CVRPEnv to match max_time, will be scaled
         max_time: int = 480,
         scale: bool = False,
+        max_vehicles: int = None,
+        lateness_penalty: float = 10.0,
+        vehicle_penalty: float = 10.0,
         **kwargs,
     ):
         self.min_time = 0  # always 0
         self.max_time = max_time
         self.scale = scale
+        self.lateness_penalty = lateness_penalty
+        self.vehicle_penalty = vehicle_penalty
         super().__init__(max_loc=max_loc, **kwargs)
+        self.max_vehicles = max_vehicles if max_vehicles is not None else self.num_loc
 
     def _make_spec(self, td_params: TensorDict):
         super()._make_spec(td_params)
@@ -59,6 +65,13 @@ class CVRPTWEnv(CVRPEnv):
         current_loc = UnboundedContinuousTensorSpec(
             shape=(2), dtype=torch.float32, device=self.device
         )
+
+        # current_vehicle = BoundedTensorSpec(
+        #     low=0,
+        #     high=self.max_vehicles,
+        #     shape=(1),
+        #     dtype=torch.int64,
+        # )
 
         durations = BoundedTensorSpec(
             low=self.min_time,
@@ -84,6 +97,7 @@ class CVRPTWEnv(CVRPEnv):
             **self.observation_spec,
             current_time=current_time,
             current_loc=current_loc,
+            # current_vehicle=current_vehicle,
             durations=durations,
             time_windows=time_windows,
             # vehicle_idx=vehicle_idx,
@@ -187,12 +201,25 @@ class CVRPTWEnv(CVRPEnv):
         can_reach_in_time = (
             td["current_time"] + dist <= td["time_windows"][..., 1]
         )  # I only need to start the service before the time window ends, not finish it.
-        return not_masked & can_reach_in_time
+        last_vehicle = td["current_vehicle"] == td["max_vehicles"] - 1
+        # as long as there are unserved nodes, don't allow the last vehicle going back to the depot
+        if "done" in td.keys():  # only available after going through _step at least once
+            last_vehicle = torch.cat(
+                (td["done"], last_vehicle.expand(-1, td["locs"].shape[-2] - 1)), -1
+            )
+        # if I'm on the last vehicle and the capacity is not enough to serve the remaining customers,
+        # go back to the depot to refill, but with the same vehicle, i.e. without resetting current_time
+        final_mask = not_masked & (can_reach_in_time | last_vehicle)
+        go_back = (final_mask.sum(-1) == 0) & (
+            td["visited"].sum(-1) < td["visited"].shape[-1]
+        ).squeeze(-1)
+        final_mask[go_back, 0] = True
+        return final_mask
 
     def _step(self, td: TensorDict) -> TensorDict:
         """In addition to the calculations in the CVRPEnv, the current time is
         updated to keep track of which nodes are still reachable in time.
-        The current_node is updeted in the parent class' _step() function.
+        The current_node is updated in the parent class' _step() function.
         """
         batch_size = td["locs"].shape[0]
         # update current_time
@@ -201,11 +228,16 @@ class CVRPTWEnv(CVRPEnv):
         start_times = gather_by_index(td["time_windows"], td["action"])[..., 0].reshape(
             [batch_size, 1]
         )
-        td["current_time"] = (td["action"][:, None] != 0) * (
-            torch.max(td["current_time"] + distance, start_times) + duration
-        )
+        td["current_time"] = (
+            (td["action"][:, None] != 0)
+            | (td["current_vehicle"] == td["max_vehicles"] - 1)
+        ) * (torch.max(td["current_time"] + distance, start_times) + duration)
         # current_node is updated to the selected action
         td = super()._step(td)
+        # send out next vehicle when going back to the depot
+        td["current_vehicle"] += (
+            (td["current_node"] == 0) & (td["current_vehicle"] != td["max_vehicles"] - 1)
+        ).int()
         return td
 
     def _reset(
@@ -221,14 +253,25 @@ class CVRPTWEnv(CVRPEnv):
         # Create reset TensorDict
         td_reset = TensorDict(
             {
-                "locs": torch.cat((td["depot"][..., None, :], td["locs"]), -2),
-                "demand": td["demand"],
                 "current_node": torch.zeros(
                     *batch_size, 1, dtype=torch.long, device=self.device
                 ),
                 "current_time": torch.zeros(
                     *batch_size, 1, dtype=torch.float32, device=self.device
                 ),
+                "current_vehicle": torch.zeros(
+                    *batch_size, 1, dtype=torch.long, device=self.device
+                ),
+                "demand": td["demand"],
+                "durations": td["durations"],
+                "feasible": torch.ones(
+                    *batch_size, 1, dtype=torch.bool, device=self.device
+                ),
+                "locs": torch.cat((td["depot"][..., None, :], td["locs"]), -2),
+                "max_vehicles": torch.tensor(
+                    self.max_vehicles, device=self.device
+                ).repeat(*batch_size, 1),
+                "time_windows": td["time_windows"],
                 "used_capacity": torch.zeros((*batch_size, 1), device=self.device),
                 "vehicle_capacity": torch.full(
                     (*batch_size, 1), self.vehicle_capacity, device=self.device
@@ -238,8 +281,6 @@ class CVRPTWEnv(CVRPEnv):
                     dtype=torch.uint8,
                     device=self.device,
                 ),
-                "durations": td["durations"],
-                "time_windows": td["time_windows"],
             },
             batch_size=batch_size,
         )
@@ -247,9 +288,64 @@ class CVRPTWEnv(CVRPEnv):
         return td_reset
 
     def get_reward(self, td: TensorDict, actions: TensorDict) -> TensorDict:
-        """The reward is the negative tour length. Time windows
-        are not considered for the calculation of the reward."""
-        return super().get_reward(td, actions)
+        """The reward is the negative tour length including penalties for lateness
+        and for additional routes needed when the vehicle capacity is exceeded."""
+        if self.check_solution:
+            try:
+                self.check_solution_validity(td, actions)
+            except AssertionError as e:
+                td["feasible"] = False
+                print(e)
+        coords = td["locs"]
+        batch_size = coords.shape[0]
+        actions_ordered = torch.cat(
+            [torch.zeros(batch_size, 1, dtype=torch.int32, device=self.device), actions],
+            dim=1,
+        )
+        actions_shifted = torch.roll(actions_ordered, -1, dims=-1)
+        distances = get_distance(
+            gather_by_index(coords, actions_ordered),
+            gather_by_index(coords, actions_shifted),
+        )
+        current_time = torch.zeros(batch_size, 1, dtype=torch.float32, device=self.device)
+        total_costs = torch.zeros(batch_size, 1, dtype=torch.float32, device=self.device)
+        for batch in range(batch_size):
+            number_routes = 0
+            for step in range(len(actions_ordered[batch])):
+                # reset if starting new route and not on last vehicle
+                current_time[batch] = (
+                    (actions_ordered[batch, step] == 0)
+                    & (number_routes < td["max_vehicles"][batch])
+                ) * 0.0
+                # continue counting
+                current_time[batch] = torch.max(
+                    current_time[batch] + distances[batch, step],
+                    td["time_windows"][batch, actions_shifted[batch, step], 0],
+                )
+                lateness = torch.max(
+                    current_time[batch]
+                    - td["time_windows"][batch, actions_shifted[batch, step], 1],
+                    torch.zeros_like(current_time[batch]),
+                )
+                if lateness > 0:  # this check belongs in check_solution_validity
+                    td["feasible"][batch] = False
+                if (actions_shifted[batch, step] == 0) & (
+                    actions_ordered[batch, step] != 0
+                ):
+                    number_routes += 1
+                total_costs[batch] += (
+                    distances[batch, step] + lateness * self.lateness_penalty
+                )
+            total_costs[batch] += (
+                torch.max(
+                    number_routes - td["max_vehicles"][batch],
+                    torch.zeros_like(td["max_vehicles"][batch]),
+                )
+                * self.vehicle_penalty
+            )
+            if number_routes > td["max_vehicles"][batch]:
+                td["feasible"][batch] = False
+        return -total_costs.squeeze(-1)
 
     @staticmethod
     def check_solution_validity(td: TensorDict, actions: torch.Tensor):
@@ -298,6 +394,7 @@ class CVRPTWEnv(CVRPEnv):
             )
             curr_node = next_node
             curr_time[curr_node == 0] = 0.0  # reset time for depot
+        # TODO check number of routes vs. max_vehicles
 
     @staticmethod
     def render(td: TensorDict, actions=None, ax=None, scale_xy: bool = False, **kwargs):
@@ -371,3 +468,61 @@ class CVRPTWEnv(CVRPEnv):
             batch_size=1,  # we assume batch_size will always be 1 for loaded instances
         )
         return self.reset(td, batch_size=batch_size)
+
+
+if __name__ == "__main__":
+    from rl4co.models.nn.utils import rollout, random_policy
+
+    device_str = (
+        "cuda"
+        if torch.cuda.is_available()
+        else (
+            "mps"
+            if (torch.backends.mps.is_available() and torch.backends.mps.is_built())
+            else "cpu"
+        )
+    )
+    device = torch.device(device_str)
+
+    import numpy
+
+    num_locs = [5, 10, 20, 50, 100, 200, 500, 1000]
+    max_vehicles = [3, 5, 10, 20, 50, 100, 200, 500]
+    ratios = numpy.empty((len(num_locs), len(max_vehicles)), dtype=int)
+    max_steps = 100_000
+    batch_size = 128 * 8
+
+    for ii in range(len(num_locs)):
+        for jj in range(len(max_vehicles)):
+            num_loc = num_locs[ii]
+            max_vehicle = max_vehicles[jj]
+            # if num_locs[ii] <= max_vehicles[jj]:
+            #     ratios[ii, jj] = 1
+            #     continue
+            is_feasible = 0
+            env = CVRPTWEnv(
+                num_loc=num_loc,
+                min_loc=0,
+                max_loc=150,
+                min_demand=1,
+                max_demand=10,
+                vehicle_capacity=1,
+                capacity=10,
+                max_time=480,
+                scale=True,
+                device=device_str,
+                check_solution=False,
+                max_vehicles=max_vehicle,
+            )
+            reward, td, actions = rollout(
+                env=env,
+                td=env.reset(batch_size=[batch_size]).to(device),
+                policy=random_policy,
+                max_steps=max_steps,
+            )
+            ratios[ii, jj] = td["feasible"].float().mean()
+            print(
+                f"Ratio of feasible solutions for {num_locs[ii]} locations and {max_vehicles[jj]} vehicles:",
+                ratios[ii, jj],
+            )
+    print(ratios)
