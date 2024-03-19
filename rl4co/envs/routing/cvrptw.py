@@ -490,17 +490,18 @@ if __name__ == "__main__":
     num_locs = [10, 20, 50, 100, 150, 200, 250, 300, 350, 400, 450, 500]
     max_vehicles = [5, 10, 20, 50, 100, 150, 200, 250]
     ratios = numpy.empty((len(num_locs), len(max_vehicles)), dtype=float)
-    iterations = 1_000
-    max_steps = 100_000_000
+    max_steps = 100_000
     batch_size = 128 * 8
 
     for ii in range(len(num_locs)):
         for jj in range(len(max_vehicles)):
-            tmp = numpy.empty(iterations, dtype=float)
             num_loc = num_locs[ii]
             max_vehicle = max_vehicles[jj]
             if num_locs[ii] <= max_vehicles[jj]:
                 ratios[ii, jj] = 1
+                continue
+            if num_locs[ii] > 3 * max_vehicles[jj]:
+                ratios[ii, jj] = 0
                 continue
             env = CVRPTWEnv(
                 num_loc=num_loc,
@@ -516,20 +517,17 @@ if __name__ == "__main__":
                 check_solution=False,
                 max_vehicles=max_vehicle,
             )
-            for kk in range(iterations):
-                reward, td, actions = rollout(
-                    env=env,
-                    td=env.reset(batch_size=[batch_size]).to(device),
-                    policy=random_policy,
-                    max_steps=max_steps,
-                )
-                tmp[kk] = td["feasible"].float().mean()
-            ratios[ii, jj] = numpy.mean(tmp)
+            reward, td, actions = rollout(
+                env=env,
+                td=env.reset(batch_size=[int(batch_size * (num_loc / 10))]).to(device),
+                policy=random_policy,
+                max_steps=max_steps,
+            )
+            ratios[ii, jj] = td["feasible"].float().mean()
             print(
                 f"Ratio of feasible solutions for {num_locs[ii]} locations and {max_vehicles[jj]} vehicles:",
                 ratios[ii, jj],
             )
 
     df = pd.DataFrame(ratios, index=num_locs, columns=max_vehicles)
-    # df.to_csv(f"/data/feasibility_ratios_{iterations}.csv")
-    df.to_csv(f"feasibility_ratios_{iterations}_iterations.csv")
+    df.to_csv(f"feasibility_ratios.csv")
