@@ -46,6 +46,6 @@ trainer:
 
 seed: 1234
 
-ckpt_path: ${paths.output_dir}/ckpts/
+# ckpt_path: ${paths.output_dir}/ckpts/
 
 
