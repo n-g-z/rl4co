@@ -1,7 +1,7 @@
 # @package _global_
 
 defaults:
-  - override /model: pomo.yaml
+  - override /model: am.yaml
   - override /env: cvrptw.yaml
   - override /callbacks: default.yaml
   - override /trainer: default.yaml
@@ -21,9 +21,9 @@ env:
 logger:
   wandb:
     project: "rl4co"
-    tags: ["pomo", "${env.name}"]
+    tags: ["am", "${env.name}"]
     group: ${env.name}${env.num_loc}
-    name: pomo-${env.name}${env.num_loc}-lim${env.max_vehicles}
+    name: am-${env.name}${env.num_loc}-lim${env.max_vehicles}
 
 model:
   batch_size: 512
