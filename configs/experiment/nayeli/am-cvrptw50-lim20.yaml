@@ -17,6 +17,7 @@ env:
   min_time: 0
   max_time: 480
   max_vehicles: 20
+  check_solution: False
 
 logger:
   wandb:
