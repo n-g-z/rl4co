@@ -485,7 +485,8 @@ if __name__ == "__main__":
     device = torch.device(device_str)
 
     import numpy
-    import pandas as pd
+
+    # import pandas as pd
 
     num_locs = [10, 20, 50, 100, 150, 200, 250, 300, 350, 400, 450, 500]
     max_vehicles = [5, 10, 20, 50, 100, 150, 200, 250]
@@ -529,5 +530,5 @@ if __name__ == "__main__":
                 ratios[ii, jj],
             )
 
-    df = pd.DataFrame(ratios, index=num_locs, columns=max_vehicles)
-    df.to_csv(f"feasibility_ratios.csv")
+    # df = pd.DataFrame(ratios, index=num_locs, columns=max_vehicles)
+    # df.to_csv(f"feasibility_ratios.csv")
