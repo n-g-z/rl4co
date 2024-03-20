@@ -9,7 +9,7 @@ from torchrl.data import (
 )
 
 from rl4co.envs.routing.cvrp import CVRPEnv, CAPACITIES
-from rl4co.utils.ops import gather_by_index, get_distance, get_distance_matrix
+from rl4co.utils.ops import gather_by_index, get_distance_matrix
 from rl4co.data.utils import (
     load_npz_to_tensordict,
     load_solomon_instance,
@@ -94,14 +94,21 @@ class CVRPTWEnv(CVRPEnv):
     def extract_distance_matrix(self, td: TensorDict):
         if "distance_matrix" not in td.keys():
             if self.distance_matrix is not None:
-                td["distance_matrix"] = self.distance_matrix
+                if self.distance_matrix.shape[0] == td["locs"].shape[0]:
+                    td["distance_matrix"] = self.distance_matrix.to(dtype=torch.float32)
+                elif self.distance_matrix.shape[0] == 1:
+                    td["distance_matrix"] = self.distance_matrix.to(
+                        dtype=torch.float32
+                    ).expand(td["locs"].shape[0], -1, -1)
             else:
                 if "depot" in td.keys():
                     td["distance_matrix"] = get_distance_matrix(
                         locs=torch.cat((td["depot"][..., None, :], td["locs"]), -2)
-                    )
+                    ).to(dtype=torch.float32)
                 else:
-                    td["distance_matrix"] = get_distance_matrix(locs=td["locs"])
+                    td["distance_matrix"] = get_distance_matrix(locs=td["locs"]).to(
+                        dtype=torch.float32
+                    )
 
     def generate_data(self, batch_size) -> TensorDict:
         """
@@ -207,8 +214,16 @@ class CVRPTWEnv(CVRPEnv):
         batch_size = td["locs"].shape[0]
         # update current_time
         distance = gather_by_index(
-            td["distance_matrix"], td["action"], dim=1, squeeze=False
-        ).squeeze(1)
+            gather_by_index(
+                td["distance_matrix"],
+                td["current_node"],
+                dim=1,
+                squeeze=False,
+            ),
+            td["action"],
+            dim=2,
+            squeeze=False,
+        ).reshape([batch_size, 1])
         duration = gather_by_index(td["durations"], td["action"]).reshape([batch_size, 1])
         start_times = gather_by_index(td["time_windows"], td["action"])[..., 0].reshape(
             [batch_size, 1]
@@ -221,8 +236,15 @@ class CVRPTWEnv(CVRPEnv):
         return td
 
     def _reset(
-        self, td: Optional[TensorDict] = None, batch_size: Optional[list] = None
+        self,
+        td: Optional[TensorDict] = None,
+        batch_size: Optional[list] = None,
+        reset_distances: bool = False,
     ) -> TensorDict:
+        if reset_distances == True:
+            self.distance_matrix = None
+            if td is not None and "distance_matrix" in td.keys():
+                td.pop("distance_matrix")
         if batch_size is None:
             batch_size = self.batch_size if td is None else td["locs"].shape[:-2]
         if td is None or td.is_empty():
@@ -282,9 +304,7 @@ class CVRPTWEnv(CVRPEnv):
         batch_size = td["locs"].shape[0]
 
         # distances to depot
-        distances = gather_by_index(
-            td["distance_matrix"], actions, dim=1, squeeze=False
-        ).squeeze(1)
+        distances = td["distance_matrix"][..., 0, :]
 
         # basic checks on time windows
         assert torch.all(distances >= 0.0), "Distances must be non-negative."
@@ -304,10 +324,11 @@ class CVRPTWEnv(CVRPEnv):
         curr_node = torch.zeros_like(curr_time, dtype=torch.int64, device=td.device)
         for ii in range(actions.size(1)):
             next_node = actions[:, ii]
-            # TODO alternative distance calculation
-            dist = get_distance(
-                gather_by_index(td["locs"], curr_node).reshape([batch_size, 2]),
-                gather_by_index(td["locs"], next_node).reshape([batch_size, 2]),
+            dist = gather_by_index(
+                gather_by_index(td["distance_matrix"], curr_node, dim=1, squeeze=False),
+                next_node,
+                dim=2,
+                squeeze=False,
             ).reshape([batch_size, 1])
             curr_time = torch.max(
                 (curr_time + dist).int(),
@@ -404,15 +425,60 @@ class CVRPTWEnv(CVRPEnv):
 
 
 if __name__ == "__main__":
-    batch_size = 3
-    env = CVRPTWEnv(
-        max_loc=150, max_time=480, scale=False, num_loc=10, vehicle_capacity=20
+    from rl4co.models.nn.utils import rollout, random_policy
+
+    device_str = (
+        "cuda"
+        if torch.cuda.is_available()
+        else (
+            "mps"
+            if (torch.backends.mps.is_available() and torch.backends.mps.is_built())
+            else "cpu"
+        )
     )
-    td_reset = env.reset(batch_size=batch_size)
+    device = torch.device(device_str)
+
+    env = CVRPTWEnv(scale=False)
+    # random rollout
+    reward, td_rnd, actions = rollout(
+        env=env,
+        td=env.reset(batch_size=[1], reset_distances=False).to(device),
+        policy=random_policy,
+        max_steps=100_000,
+    )
+    # solomon data
+    name = "C101"
     instance = env.load_data(
-        name="C101", solomon=True, type="instance", compute_edge_weights=True
+        name=name, solomon=True, type="instance", compute_edge_weights=True
     )
-    td = env.extract_from_solomon(instance=instance)
-    # td = env.reset(td)
-    # env.generate_data(batch_size=3)
-    print(td)
+    sol = env.load_data(name=name, solomon=True, type="solution")
+    td = env.extract_from_solomon(instance=instance).to(device=device)
+
+    actions = []
+    for route in sol["routes"]:
+        actions.extend(route)
+        actions.append(0)
+
+    actions = torch.Tensor(actions).unsqueeze(0).to(device=device, dtype=torch.int64)
+    reward = env.get_reward(td, actions)
+    print(
+        "Optimal solution:\n\tactions: ",
+        actions,
+        "\n\tcalculated reward:",
+        reward,
+        "\n\treported reward:",
+        sol["cost"],
+        "\t(diff: ",
+        (-reward.item() - sol["cost"]) / sol["cost"] * 100,
+        "%",
+        ")",
+    )
+    CVRPTWEnv.check_solution_validity(td, actions)
+
+    reward, _, actions = rollout(
+        env=env,
+        td=td,
+        policy=random_policy,
+        max_steps=100_000,
+    )
+    print("Random rollout:\n\treward:", reward, "\n\tactions: ", actions)
