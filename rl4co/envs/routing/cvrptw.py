@@ -109,17 +109,15 @@ class CVRPTWEnv(CVRPEnv):
         )
 
         ## define time windows
-        # 1. get distances from depot
-        if self.distance_matrix is not None:
-            dist = gather_by_index(
-                self.distance_matrix, td["depot"], dim=1, squeeze=False
-            ).squeeze(1)
-            dist = self.distance_matrix[td["depot"]].squeeze(0)
-        else:
-            dist = get_distance(td["depot"], td["locs"].transpose(0, 1)).transpose(0, 1)
-            dist = torch.cat(
-                (torch.zeros(*batch_size, 1, device=self.device), dist), dim=1
-            )
+        # 1. get distances from depot (we don't necessarily have the distance matrix in td yet)
+        if "distance_matrix" not in td.keys():
+            if self.distance_matrix is not None:
+                td["distance_matrix"] = self.distance_matrix
+            else:
+                td["distance_matrix"] = get_distance_matrix(
+                    locs=torch.cat((td["depot"][..., None, :], td["locs"]), -2)
+                )
+        dist = td["distance_matrix"][..., 0, :]
         # 2. define upper bound for time windows to make sure the vehicle can get back to the depot in time
         upper_bound = self.max_time - dist - durations
         # 3. create random values between 0 and 1
@@ -164,6 +162,7 @@ class CVRPTWEnv(CVRPEnv):
             max_times = max_times / self.max_time
             td["depot"] = td["depot"] / self.max_time
             td["locs"] = td["locs"] / self.max_time
+            td["distance_matrix"] = td["distance_matrix"] / self.max_time
 
         # 8. stack to tensor time_windows
         time_windows = torch.stack((min_times, max_times), dim=-1)
@@ -183,9 +182,7 @@ class CVRPTWEnv(CVRPEnv):
         return td
 
     @staticmethod
-    def get_action_mask(
-        td: TensorDict, distance_matrix: torch.Tensor = None
-    ) -> torch.Tensor:
+    def get_action_mask(td: TensorDict) -> torch.Tensor:
         """In addition to the constraints considered in the CVRPEnv, the time windows are considered.
         The vehicle can only visit a location if it can reach it in time, i.e. before its time window ends.
         """
@@ -194,12 +191,9 @@ class CVRPTWEnv(CVRPEnv):
         current_loc = gather_by_index(td["locs"], td["current_node"]).reshape(
             [batch_size, 2]
         )
-        if distance_matrix is not None:
-            dist = gather_by_index(
-                distance_matrix, td["current_node"], dim=1, squeeze=False
-            ).squeeze(1)
-        else:
-            dist = get_distance(current_loc, td["locs"].transpose(0, 1)).transpose(0, 1)
+        dist = gather_by_index(
+            td["distance_matrix"], td["current_node"], dim=1, squeeze=False
+        ).squeeze(1)
         # td.update({"current_loc": current_loc, "distances": dist})
         can_reach_in_time = (
             td["current_time"] + dist <= td["time_windows"][..., 1]
@@ -213,8 +207,10 @@ class CVRPTWEnv(CVRPEnv):
         """
         batch_size = td["locs"].shape[0]
         # update current_time
-        # TODO use alternative distance calculation
-        distance = gather_by_index(td["distances"], td["action"]).reshape([batch_size, 1])
+        distance = gather_by_index(
+            td["distance_matrix"], td["action"], dim=1, squeeze=False
+        ).squeeze(1)
+        # distance = gather_by_index(td["distances"], td["action"]).reshape([batch_size, 1])
         duration = gather_by_index(td["durations"], td["action"]).reshape([batch_size, 1])
         start_times = gather_by_index(td["time_windows"], td["action"])[..., 0].reshape(
             [batch_size, 1]
@@ -245,14 +241,17 @@ class CVRPTWEnv(CVRPEnv):
         # Create reset TensorDict
         td_reset = TensorDict(
             {
-                "locs": locs_all,
-                "demand": td["demand"],
                 "current_node": torch.zeros(
                     *batch_size, 1, dtype=torch.long, device=self.device
                 ),
                 "current_time": torch.zeros(
                     *batch_size, 1, dtype=torch.float32, device=self.device
                 ),
+                "demand": td["demand"],
+                "distance_matrix": self.distance_matrix,
+                "durations": td["durations"],
+                "locs": locs_all,
+                "time_windows": td["time_windows"],
                 "used_capacity": torch.zeros((*batch_size, 1), device=self.device),
                 "vehicle_capacity": torch.full(
                     (*batch_size, 1), self.vehicle_capacity, device=self.device
@@ -262,14 +261,12 @@ class CVRPTWEnv(CVRPEnv):
                     dtype=torch.uint8,
                     device=self.device,
                 ),
-                "durations": td["durations"],
-                "time_windows": td["time_windows"],
             },
             batch_size=batch_size,
         )
         td_reset.set(
             "action_mask",
-            self.get_action_mask(td_reset, distance_matrix=self.distance_matrix),
+            self.get_action_mask(td_reset),
         )
         return td_reset
 
@@ -279,18 +276,15 @@ class CVRPTWEnv(CVRPEnv):
         return super().get_reward(td, actions)
 
     @staticmethod
-    def check_solution_validity(
-        td: TensorDict, actions: torch.Tensor, distance_matrix: torch.Tensor = None
-    ):
+    def check_solution_validity(td: TensorDict, actions: torch.Tensor):
         CVRPEnv.check_solution_validity(td, actions)
         batch_size = td["locs"].shape[0]
+
         # distances to depot
-        if distance_matrix is not None:  # TODO check and fix
-            distances = distance_matrix[td["locs"]].squeeze(0)
-        else:
-            distances = get_distance(
-                td["locs"][..., 0, :], td["locs"].transpose(0, 1)
-            ).transpose(0, 1)
+        distances = gather_by_index(
+            td["distance_matrix"], actions, dim=1, squeeze=False
+        ).squeeze(1)
+
         # basic checks on time windows
         assert torch.all(distances >= 0.0), "Distances must be non-negative."
         assert torch.all(td["time_windows"] >= 0.0), "Time windows must be non-negative."
@@ -309,6 +303,7 @@ class CVRPTWEnv(CVRPEnv):
         curr_node = torch.zeros_like(curr_time, dtype=torch.int64, device=td.device)
         for ii in range(actions.size(1)):
             next_node = actions[:, ii]
+            # TODO alternative distance calculation
             dist = get_distance(
                 gather_by_index(td["locs"], curr_node).reshape([batch_size, 2]),
                 gather_by_index(td["locs"], next_node).reshape([batch_size, 2]),
@@ -412,8 +407,8 @@ if __name__ == "__main__":
     env = CVRPTWEnv(
         max_loc=150, max_time=480, scale=False, num_loc=10, vehicle_capacity=20
     )
-    env.generate_data(batch_size=batch_size)
     td = env.reset(batch_size=batch_size)
+    env.generate_data(batch_size=batch_size)
     # instance = env.load_data(
     #     name="C101", solomon=True, type="instance", compute_edge_weights=False
     # )
