@@ -9,7 +9,7 @@ from torchrl.data import (
 )
 
 from rl4co.envs.routing.cvrp import CVRPEnv, CAPACITIES
-from rl4co.utils.ops import gather_by_index, get_distance, get_distance_matrix
+from rl4co.utils.ops import gather_by_index, get_distance_matrix
 from rl4co.data.utils import (
     load_npz_to_tensordict,
     load_solomon_instance,
@@ -341,7 +341,7 @@ class CVRPTWEnv(CVRPEnv):
             try:
                 self.check_solution_validity(td, actions)
             except AssertionError as e:
-                td["feasible"] = False
+                # td["feasible"] = False
                 print(e)
         coords = td["locs"]
         batch_size = coords.shape[0]
@@ -350,11 +350,12 @@ class CVRPTWEnv(CVRPEnv):
             dim=1,
         )
         actions_shifted = torch.roll(actions_ordered, -1, dims=-1)
-        # TODO adjust distance calculation
-        distances = get_distance(
-            gather_by_index(coords, actions_ordered),
-            gather_by_index(coords, actions_shifted),
-        )
+        distances = gather_by_index(
+            gather_by_index(td["distance_matrix"], actions_ordered, dim=1, squeeze=False),
+            actions_shifted,
+            dim=2,
+            squeeze=False,
+        ).squeeze(-1)
         current_time = torch.zeros(batch_size, 1, dtype=torch.float32, device=self.device)
         total_costs = torch.zeros(batch_size, 1, dtype=torch.float32, device=self.device)
         for batch in range(batch_size):
@@ -472,8 +473,7 @@ class CVRPTWEnv(CVRPEnv):
             return instance
         return load_npz_to_tensordict(filename=name)
 
-    def extract_from_solomon(self, instance: dict):
-        batch_size = 1  # we assume batch_size will always be 1 for loaded instances
+    def extract_from_solomon(self, instance: dict, batch_size: int = 1):
         # extract parameters for the environment from the Solomon instance
         self.min_demand = instance["demand"][1:].min()
         self.max_demand = instance["demand"][1:].max()
@@ -486,7 +486,7 @@ class CVRPTWEnv(CVRPEnv):
             self.distance_matrix = (
                 torch.from_numpy(instance["edge_weight"])
                 .expand(batch_size, -1, -1)
-                .to(self.device)
+                .to(self.device, dtype=torch.float32)
             )
         # assert the time window of the depot starts at 0 and ends at max_time
         assert self.min_time == 0, "Time window of depot must start at 0."
@@ -536,95 +536,30 @@ if __name__ == "__main__":
     )
     device = torch.device(device_str)
 
-    import numpy
+    ## Solomon instances
+    import vrplib
 
-    # import pandas as pd
+    names = vrplib.list_names(vrp_type="vrptw")
+    ratios = {}
 
-    num_locs = [10, 20, 50, 100, 150, 200, 250, 300, 350, 400, 450, 500]
-    max_vehicles = [5, 10, 20, 50, 100, 150, 200, 250]
-    ratios = numpy.empty((len(num_locs), len(max_vehicles)), dtype=float)
-    max_steps = 100_000
-    batch_size = 128 * 8
+    for name in names:
+        if name[0] != "R" or name[1] == "C":
+            continue
+        print(name)
+        env = CVRPTWEnv(scale=False, device=device_str)
+        instance = env.load_data(
+            name=name, solomon=True, type="instance", compute_edge_weights=True
+        )
+        sol = env.load_data(name=name, solomon=True, type="solution")
+        td = env.extract_from_solomon(instance=instance, batch_size=3).to(device=device)
 
-    for ii in range(len(num_locs)):
-        for jj in range(len(max_vehicles)):
-            num_loc = num_locs[ii]
-            max_vehicle = max_vehicles[jj]
-            if num_locs[ii] <= max_vehicles[jj]:
-                ratios[ii, jj] = 1
-                continue
-            if num_locs[ii] > 3 * max_vehicles[jj]:
-                ratios[ii, jj] = 0
-                continue
-            env = CVRPTWEnv(
-                num_loc=num_loc,
-                min_loc=0,
-                max_loc=150,
-                min_demand=1,
-                max_demand=10,
-                vehicle_capacity=1,
-                capacity=10,
-                max_time=480,
-                scale=True,
-                device=device_str,
-                check_solution=False,
-                max_vehicles=max_vehicle,
-            )
-            reward, td, actions = rollout(
-                env=env,
-                td=env.reset(batch_size=[int(batch_size * (num_loc / 10))]).to(device),
-                policy=random_policy,
-                max_steps=max_steps,
-            )
-            ratios[ii, jj] = td["feasible"].float().mean()
-            print(
-                f"Ratio of feasible solutions for {num_locs[ii]} locations and {max_vehicles[jj]} vehicles:",
-                ratios[ii, jj],
-            )
-
-    # df = pd.DataFrame(ratios, index=num_locs, columns=max_vehicles)
-    # df.to_csv(f"feasibility_ratios.csv")
-    env = CVRPTWEnv(scale=False)
-    # random rollout
-    reward, td_rnd, actions = rollout(
-        env=env,
-        td=env.reset(batch_size=[1], reset_distances=False).to(device),
-        policy=random_policy,
-        max_steps=100_000,
-    )
-    # solomon data
-    name = "C101"
-    instance = env.load_data(
-        name=name, solomon=True, type="instance", compute_edge_weights=True
-    )
-    sol = env.load_data(name=name, solomon=True, type="solution")
-    td = env.extract_from_solomon(instance=instance).to(device=device)
-
-    actions = []
-    for route in sol["routes"]:
-        actions.extend(route)
-        actions.append(0)
-
-    actions = torch.Tensor(actions).unsqueeze(0).to(device=device, dtype=torch.int64)
-    reward = env.get_reward(td, actions)
-    print(
-        "Optimal solution:\n\tactions: ",
-        actions,
-        "\n\tcalculated reward:",
-        reward,
-        "\n\treported reward:",
-        sol["cost"],
-        "\t(diff: ",
-        (-reward.item() - sol["cost"]) / sol["cost"] * 100,
-        "%",
-        ")",
-    )
-    CVRPTWEnv.check_solution_validity(td, actions)
-
-    reward, _, actions = rollout(
-        env=env,
-        td=td,
-        policy=random_policy,
-        max_steps=100_000,
-    )
-    print("Random rollout:\n\treward:", reward, "\n\tactions: ", actions)
+        reward, _, actions = rollout(
+            env=env,
+            td=td,
+            policy=random_policy,
+            max_steps=100_000,
+        )
+        ratios[name] = td["feasible"].float().mean()
+        if len(ratios) > 5:
+            break
+    print(ratios)
