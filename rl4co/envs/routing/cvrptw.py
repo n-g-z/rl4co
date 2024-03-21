@@ -341,10 +341,8 @@ class CVRPTWEnv(CVRPEnv):
             try:
                 self.check_solution_validity(td, actions)
             except AssertionError as e:
-                # td["feasible"] = False
                 print(e)
-        coords = td["locs"]
-        batch_size = coords.shape[0]
+        batch_size = td["locs"].shape[0]
         actions_ordered = torch.cat(
             [torch.zeros(batch_size, 1, dtype=torch.int32, device=self.device), actions],
             dim=1,
@@ -445,7 +443,11 @@ class CVRPTWEnv(CVRPEnv):
             )
             curr_node = next_node
             curr_time[curr_node == 0] = 0.0  # reset time for depot
-        # TODO check number of routes vs. max_vehicles
+        indices = torch.nonzero(actions == 0)
+        for batch in range(batch_size):
+            num_routes = len([ii for ii in indices if ii[0] == batch])
+            num_routes += 1 if actions[batch, -1] != 0 else 0
+            assert num_routes <= td["max_vehicles"][batch], "too many routes"
 
     @staticmethod
     def render(td: TensorDict, actions=None, ax=None, scale_xy: bool = False, **kwargs):
@@ -482,6 +484,7 @@ class CVRPTWEnv(CVRPEnv):
         self.max_loc = instance["node_coord"][1:].max()
         self.min_time = instance["time_window"][:, 0].min()
         self.max_time = instance["time_window"][:, 1].max()
+        self.max_vehicles = instance["vehicles"]
         if "edge_weight" in instance:
             self.distance_matrix = (
                 torch.from_numpy(instance["edge_weight"])
@@ -540,18 +543,20 @@ if __name__ == "__main__":
     import vrplib
 
     names = vrplib.list_names(vrp_type="vrptw")
-    ratios = {}
+    batch_size = 128 * 8
+    results = []
 
     for name in names:
-        if name[0] != "R" or name[1] == "C":
-            continue
-        print(name)
+        # if name[0] != "R" or name[1] == "C":
+        #     continue
         env = CVRPTWEnv(scale=False, device=device_str)
         instance = env.load_data(
             name=name, solomon=True, type="instance", compute_edge_weights=True
         )
         sol = env.load_data(name=name, solomon=True, type="solution")
-        td = env.extract_from_solomon(instance=instance, batch_size=3).to(device=device)
+        td = env.extract_from_solomon(instance=instance, batch_size=batch_size).to(
+            device=device
+        )
 
         reward, _, actions = rollout(
             env=env,
@@ -559,7 +564,20 @@ if __name__ == "__main__":
             policy=random_policy,
             max_steps=100_000,
         )
-        ratios[name] = td["feasible"].float().mean()
-        if len(ratios) > 5:
-            break
-    print(ratios)
+
+        results.append(
+            {
+                "name": name,
+                "max_vehicles": instance["vehicles"],
+                "capacity": instance["capacity"],
+                "customers": len(instance["demand"]) - 1,
+                "feasibility_ratio": td["feasible"].float().mean().item(),
+                "avg_cost": -reward.mean().item(),
+                "opt_cost": sol["cost"],
+            }
+        )
+
+    import pandas as pd
+
+    df = pd.DataFrame(results)
+    df.to_csv("solomon_cvrptw_feasibility_ratios.csv")
