@@ -9,7 +9,7 @@ from torchrl.data import (
 )
 
 from rl4co.envs.routing.cvrp import CVRPEnv, CAPACITIES
-from rl4co.utils.ops import gather_by_index, get_distance_matrix
+from rl4co.utils.ops import gather_by_index, get_distance_matrix, get_distances_dm
 from rl4co.data.utils import (
     load_npz_to_tensordict,
     load_solomon_instance,
@@ -348,12 +348,7 @@ class CVRPTWEnv(CVRPEnv):
             dim=1,
         )
         actions_shifted = torch.roll(actions_ordered, -1, dims=-1)
-        distances = gather_by_index(
-            gather_by_index(td["distance_matrix"], actions_ordered, dim=1, squeeze=False),
-            actions_shifted,
-            dim=2,
-            squeeze=False,
-        ).squeeze(-1)
+        distances = get_distances_dm(td, actions)
         current_time = torch.zeros(batch_size, 1, dtype=torch.float32, device=self.device)
         total_costs = torch.zeros(batch_size, 1, dtype=torch.float32, device=self.device)
         for batch in range(batch_size):
@@ -543,12 +538,75 @@ if __name__ == "__main__":
     import vrplib
 
     names = vrplib.list_names(vrp_type="vrptw")
+
+    names_c = [
+        "C101",
+        "C102",
+        "C103",
+        "C104",
+        "C105",
+        "C106",
+        "C107",
+        "C108",
+        "C109",
+        "C201",
+        "C202",
+        "C203",
+        "C204",
+        "C205",
+        "C206",
+        "C207",
+        "C208",
+    ]
+    names_r = [
+        "R101",
+        "R102",
+        "R103",
+        "R104",
+        "R105",
+        "R106",
+        "R107",
+        "R108",
+        "R109",
+        "R110",
+        "R111",
+        "R112",
+        "R201",
+        "R202",
+        "R203",
+        "R204",
+        "R205",
+        "R206",
+        "R207",
+        "R208",
+        "R209",
+        "R210",
+        "R211",
+    ]
+
+    names_rc = [
+        "RC101",
+        "RC102",
+        "RC103",
+        "RC104",
+        "RC105",
+        "RC106",
+        "RC107",
+        "RC108",
+        "RC201",
+        "RC202",
+        "RC203",
+        "RC204",
+        "RC205",
+        "RC206",
+        "RC207",
+        "RC208",
+    ]
+
     batch_size = 128 * 8
     results = []
 
-    for name in names:
-        # if name[0] != "R" or name[1] == "C":
-        #     continue
+    for name in names_rc:
         env = CVRPTWEnv(scale=False, device=device_str)
         instance = env.load_data(
             name=name, solomon=True, type="instance", compute_edge_weights=True
@@ -576,8 +634,10 @@ if __name__ == "__main__":
                 "opt_cost": sol["cost"],
             }
         )
+        # if len(results) > 5:
+        #     break
 
     import pandas as pd
 
     df = pd.DataFrame(results)
-    df.to_csv("solomon_cvrptw_feasibility_ratios.csv")
+    df.to_csv("solomon_cvrptw_feasibility_ratios_RC.csv")
