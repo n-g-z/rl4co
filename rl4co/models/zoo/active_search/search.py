@@ -10,7 +10,7 @@ from torch.utils.data import Dataset
 
 from rl4co.data.transforms import StateAugmentation
 from rl4co.models.zoo.common.search import SearchBase
-from rl4co.utils.ops import batchify, get_num_starts, unbatchify
+from rl4co.utils.ops import batchify, unbatchify
 from rl4co.utils.pylogger import get_pylogger
 
 log = get_pylogger(__name__)
@@ -81,9 +81,8 @@ class ActiveSearch(SearchBase):
 
         # Instantiate augmentation
         self.augmentation = StateAugmentation(
-            self.env.name,
             num_augment=self.hparams.augment_size,
-            use_dihedral_8=self.hparams.augment_dihedral,
+            augment_fn="dihedral8" if self.hparams.augment_dihedral else "symmetric",
         )
 
         # Store original policy state dict
@@ -112,7 +111,7 @@ class ActiveSearch(SearchBase):
         td_init = self.env.reset(batch)
         n_aug, n_start, n_runs = (
             self.augmentation.num_augment,
-            get_num_starts(td_init, self.env.name),
+            self.env.get_num_starts(td_init),
             self.hparams.num_parallel_runs,
         )
         td_init = self.augmentation(td_init)

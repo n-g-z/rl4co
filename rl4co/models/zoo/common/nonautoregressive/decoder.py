@@ -53,7 +53,7 @@ class EdgeHeatmapGenerator(nn.Module):
 
         self.undirected_graph = undirected_graph
 
-    def forward(self, graph: Batch) -> Tensor:
+    def forward(self, graph: Batch) -> Tensor:  # type: ignore
         # do not reuse the input value
         edge_attr = graph.edge_attr  # type: ignore
         for layer in self.linears:
@@ -63,7 +63,7 @@ class EdgeHeatmapGenerator(nn.Module):
         heatmaps_logp = self._make_heatmaps(graph)
         return heatmaps_logp
 
-    def _make_heatmaps(self, batch_graph: Batch) -> Tensor:
+    def _make_heatmaps(self, batch_graph: Batch) -> Tensor:  # type: ignore
         graphs = batch_graph.to_data_list()
         device = graphs[0].edge_attr.device
         batch_size = len(graphs)
@@ -105,7 +105,6 @@ class NonAutoregressiveDecoder(nn.Module):
         env_name: environment name to solve
         embedding_dim: Dimension of the embeddings
         num_layers: Number of linear layers to use in the MLP
-        select_start_nodes_fn: Function to select the start nodes for multi-start decoding
         act_fn: Activation function to use between linear layers. Can be a string name or a direct callable
         linear_bias: Whether to use a bias term in the linear layers
     """
@@ -134,10 +133,11 @@ class NonAutoregressiveDecoder(nn.Module):
     def forward(
         self,
         td: TensorDict,
-        graph: Batch,
+        graph: Batch,  # type: ignore
         env: Union[str, RL4COEnvBase, None] = None,
         decode_type: str = "multistart_sampling",
         calc_reward: bool = True,
+        phase="train",
         **strategy_kwargs,
     ):
         # Instantiate environment if needed
@@ -149,25 +149,26 @@ class NonAutoregressiveDecoder(nn.Module):
         heatmaps_logp = self.heatmap_generator(graph)
 
         # setup decoding strategy
-        self.decode_strategy: DecodingStrategy = get_decoding_strategy(
+        decode_strategy: DecodingStrategy = get_decoding_strategy(
             decode_type, **strategy_kwargs
         )
-        td, env, num_starts = self.decode_strategy.pre_decoder_hook(td, env)
+        td, env, num_starts = decode_strategy.pre_decoder_hook(td, env)
 
         # Main decoding: loop until all sequences are done
         while not td["done"].all():
             log_p, mask = self._get_log_p(td, heatmaps_logp, num_starts)
-            td = self.decode_strategy.step(log_p, mask, td)
+            td = decode_strategy.step(log_p, mask, td)
             td = env.step(td)["next"]
 
-        outputs, actions, td, env = self.decode_strategy.post_decoder_hook(td, env)
+        outputs, actions, td, env = decode_strategy.post_decoder_hook(td, env)
 
         if calc_reward:
             td.set("reward", env.get_reward(td, actions))
 
         return outputs, actions, td
 
-    def _get_log_p(self, td: TensorDict, heatmaps_logp: Tensor, num_starts: int):
+    @classmethod
+    def _get_log_p(cls, td: TensorDict, heatmaps_logp: Tensor, num_starts: int):
         # Get the mask
         mask = ~td["action_mask"]
 
@@ -176,7 +177,7 @@ class NonAutoregressiveDecoder(nn.Module):
             log_p = heatmaps_logp.mean(-1)
         else:
             batch_size = heatmaps_logp.shape[0]
-            _indexer = self._multistart_batched_index(batch_size, num_starts)
+            _indexer = cls._multistart_batched_index(batch_size, num_starts)
             log_p = heatmaps_logp[_indexer, current_action, :]
 
         log_p[mask] = -torch.inf
