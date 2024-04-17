@@ -82,7 +82,6 @@ def get_distance(x: Tensor, y: Tensor):
     return (x - y).norm(p=2, dim=-1)
 
 
-@torch.jit.script
 def get_distances_dm(td: TensorDict, actions: TensorDict):
     """Compute the distance between each pair of consecutive nodes
     in the tour for a batch of tours, based on the distance matrix."""
@@ -116,7 +115,6 @@ def get_distances_dm(td: TensorDict, actions: TensorDict):
     return distances
 
 
-@torch.jit.script
 def get_total_distance(td: TensorDict, actions: TensorDict):
     """Compute the total tour distance for a batch of tours based on the distance matrix."""
     return get_distances_dm(td, actions).sum(-1)
