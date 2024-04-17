@@ -121,6 +121,46 @@ def get_total_distance(td: TensorDict, actions: TensorDict):
 
 
 @torch.jit.script
+def get_distances_dm(td: TensorDict, actions: TensorDict):
+    """Compute the distance between each pair of consecutive nodes
+    in the tour for a batch of tours, based on the distance matrix."""
+    batch_size = td["locs"].shape[0]
+    # add depot at front
+    actions_ordered = torch.cat(
+        [torch.zeros(batch_size, 1, dtype=torch.int32, device=td.device), actions],
+        dim=1,
+    )
+    actions_shifted = torch.roll(actions_ordered, -1, dims=-1)
+    if "distance_matrix" in td.keys():
+        distances = gather_by_index(
+            gather_by_index(td["distance_matrix"], actions_ordered, dim=1, squeeze=False),
+            actions_shifted,
+            dim=2,
+            squeeze=False,
+        ).squeeze(-1)
+    else:
+        depot = td["locs"][..., 0:1, :]
+        locs_ordered = torch.cat(
+            [
+                depot,
+                gather_by_index(td["locs"], actions).reshape(
+                    [batch_size, actions.size(-1), 2]
+                ),
+            ],
+            dim=1,
+        )
+        ordered_locs_next = torch.roll(locs_ordered, 1, dims=-2)
+        distances = get_distance(ordered_locs_next, locs_ordered)
+    return distances
+
+
+@torch.jit.script
+def get_total_distance(td: TensorDict, actions: TensorDict):
+    """Compute the total tour distance for a batch of tours based on the distance matrix."""
+    return get_distances_dm(td, actions).sum(-1)
+
+
+@torch.jit.script
 def get_tour_length(ordered_locs):
     """Compute the total tour distance for a batch of ordered tours.
     Computes the L2 norm between each pair of consecutive nodes in the tour and sums them up.
@@ -152,6 +192,7 @@ def get_num_starts(td, env_name=None):
         ) // 2  # only half of the nodes (i.e. pickup nodes) can be start nodes
     elif env_name in ["cvrp", "sdvrp", "mtsp", "op", "pctsp", "spctsp"]:
         num_starts = num_starts - 1  # depot cannot be a start node
+
     return num_starts
 
 
@@ -165,14 +206,18 @@ def select_start_nodes(td, env, num_starts):
         env: Environment may determine the node selection strategy
         num_starts: Number of nodes to select. This may be passed when calling the policy directly. See :class:`rl4co.models.AutoregressiveDecoder`
     """
+    num_loc = env.num_loc if hasattr(env, "num_loc") else 0xFFFFFFFF
     if env.name in ["tsp", "atsp"]:
-        selected = torch.arange(num_starts, device=td.device).repeat_interleave(
-            td.shape[0]
+        selected = (
+            torch.arange(num_starts, device=td.device).repeat_interleave(td.shape[0])
+            % num_loc
         )
     else:
         # Environments with depot: we do not select the depot as a start node
-        selected = torch.arange(1, num_starts + 1, device=td.device).repeat_interleave(
-            td.shape[0]
+        selected = (
+            torch.arange(num_starts, device=td.device).repeat_interleave(td.shape[0])
+            % num_loc
+            + 1
         )
         if env.name == "op":
             if (td["action_mask"][..., 1:].float().sum(-1) < num_starts).any():

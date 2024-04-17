@@ -25,7 +25,6 @@ class NonAutoregressivePolicy(nn.Module):
         decoder: Decoder module. Can be passed by sub-classes
         init_embedding: Model to use for the initial embedding. If None, use the default embedding for the environment
         edge_embedding: Model to use for the edge embedding. If None, use the default embedding for the environment
-        select_start_nodes_fn: Function to select the start nodes for multi-start decoding
         embedding_dim: Dimension of the embeddings
         num_encoder_layers: Number of layers in the encoder
         num_decoder_layers: Number of layers in the decoder
@@ -122,17 +121,18 @@ class NonAutoregressivePolicy(nn.Module):
             decoder_kwargs["decode_type"] = getattr(self, f"{phase}_decode_type")
 
         # DECODER: main rollout with autoregressive decoding
-        log_p, actions, td_out = self.decoder(td, graph, env, **decoder_kwargs)
+        log_p, actions, td_out = self.decoder(
+            td, graph, env, phase=phase, **decoder_kwargs
+        )
 
-        # Log likelihood is calculated within the model
-        log_likelihood = get_log_likelihood(
-            log_p, actions, td_out.get("mask", None)
-        )  # , return_sum=False).mean(-1)
+        out = {"reward": td_out["reward"]}
 
-        out = {
-            "reward": td_out["reward"],
-            "log_likelihood": log_likelihood,
-        }
+        if phase == "train":
+            # Log likelihood is calculated within the model
+            log_likelihood = get_log_likelihood(
+                log_p, actions, td_out.get("mask", None)
+            )  # , return_sum=False).mean(-1)
+            out["log_likelihood"] = log_likelihood
 
         if return_actions:
             out["actions"] = actions

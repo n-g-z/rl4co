@@ -123,6 +123,26 @@ class CVRPTWEnv(CVRPEnv):
                     td["distance_matrix"] = get_distance_matrix(locs=td["locs"]).to(
                         dtype=torch.float32
                     )
+        )
+
+    def extract_distance_matrix(self, td: TensorDict):
+        if "distance_matrix" not in td.keys():
+            if self.distance_matrix is not None:
+                if self.distance_matrix.shape[0] == td["locs"].shape[0]:
+                    td["distance_matrix"] = self.distance_matrix.to(dtype=torch.float32)
+                elif self.distance_matrix.shape[0] == 1:
+                    td["distance_matrix"] = self.distance_matrix.to(
+                        dtype=torch.float32
+                    ).expand(td["locs"].shape[0], -1, -1)
+            else:
+                if "depot" in td.keys():
+                    td["distance_matrix"] = get_distance_matrix(
+                        locs=torch.cat((td["depot"][..., None, :], td["locs"]), -2)
+                    ).to(dtype=torch.float32)
+                else:
+                    td["distance_matrix"] = get_distance_matrix(locs=td["locs"]).to(
+                        dtype=torch.float32
+                    )
 
     def generate_data(self, batch_size) -> TensorDict:
         """
@@ -142,6 +162,9 @@ class CVRPTWEnv(CVRPEnv):
         )
 
         ## define time windows
+        # 1. get distances from depot (we don't necessarily have the distance matrix in td yet)
+        self.extract_distance_matrix(td)
+        dist = td["distance_matrix"][..., 0, :]
         # 1. get distances from depot (we don't necessarily have the distance matrix in td yet)
         self.extract_distance_matrix(td)
         dist = td["distance_matrix"][..., 0, :]
@@ -188,6 +211,7 @@ class CVRPTWEnv(CVRPEnv):
             min_times = min_times / self.max_time
             max_times = max_times / self.max_time
             td["distance_matrix"] = td["distance_matrix"] / self.max_time
+            td["distance_matrix"] = td["distance_matrix"] / self.max_time
 
         # 8. stack to tensor time_windows
         time_windows = torch.stack((min_times, max_times), dim=-1)
@@ -212,6 +236,9 @@ class CVRPTWEnv(CVRPEnv):
         The vehicle can only visit a location if it can reach it in time, i.e. before its time window ends.
         """
         not_masked = CVRPEnv.get_action_mask(td)
+        dist = gather_by_index(
+            td["distance_matrix"], td["current_node"], dim=1, squeeze=False
+        ).squeeze(1)
         dist = gather_by_index(
             td["distance_matrix"], td["current_node"], dim=1, squeeze=False
         ).squeeze(1)
@@ -251,6 +278,17 @@ class CVRPTWEnv(CVRPEnv):
             dim=2,
             squeeze=False,
         ).reshape([batch_size, 1])
+        distance = gather_by_index(
+            gather_by_index(
+                td["distance_matrix"],
+                td["current_node"],
+                dim=1,
+                squeeze=False,
+            ),
+            td["action"],
+            dim=2,
+            squeeze=False,
+        ).reshape([batch_size, 1])
         duration = gather_by_index(td["durations"], td["action"]).reshape([batch_size, 1])
         start_times = gather_by_index(td["time_windows"], td["action"])[..., 0].reshape(
             [batch_size, 1]
@@ -272,7 +310,15 @@ class CVRPTWEnv(CVRPEnv):
         td: Optional[TensorDict] = None,
         batch_size: Optional[list] = None,
         reset_distances: bool = False,
+        self,
+        td: Optional[TensorDict] = None,
+        batch_size: Optional[list] = None,
+        reset_distances: bool = False,
     ) -> TensorDict:
+        if reset_distances == True:
+            self.distance_matrix = None
+            if td is not None and "distance_matrix" in td.keys():
+                td.pop("distance_matrix")
         if reset_distances == True:
             self.distance_matrix = None
             if td is not None and "distance_matrix" in td.keys():
@@ -284,6 +330,15 @@ class CVRPTWEnv(CVRPEnv):
         batch_size = [batch_size] if isinstance(batch_size, int) else batch_size
 
         self.to(td.device)
+
+        # calculate distance matrix, if not available
+        self.extract_distance_matrix(td)
+
+        if "depot" in td.keys():
+            all_locs = torch.cat((td["depot"][..., None, :], td["locs"]), -2)
+        else:
+            all_locs = td["locs"]
+
 
         # calculate distance matrix, if not available
         self.extract_distance_matrix(td)
@@ -322,11 +377,16 @@ class CVRPTWEnv(CVRPEnv):
                 ),
                 "visited": torch.zeros(
                     (*batch_size, 1, all_locs.shape[-2]),
+                    (*batch_size, 1, all_locs.shape[-2]),
                     dtype=torch.uint8,
                     device=self.device,
                 ),
             },
             batch_size=batch_size,
+        )
+        td_reset.set(
+            "action_mask",
+            self.get_action_mask(td_reset),
         )
         td_reset.set(
             "action_mask",
@@ -394,7 +454,10 @@ class CVRPTWEnv(CVRPEnv):
         CVRPEnv.check_solution_validity(td, actions)
         batch_size = td["locs"].shape[0]
 
+
         # distances to depot
+        distances = td["distance_matrix"][..., 0, :]
+
         distances = td["distance_matrix"][..., 0, :]
 
         # basic checks on time windows
@@ -415,6 +478,11 @@ class CVRPTWEnv(CVRPEnv):
         curr_node = torch.zeros_like(curr_time, dtype=torch.int64, device=td.device)
         for ii in range(actions.size(1)):
             next_node = actions[:, ii]
+            dist = gather_by_index(
+                gather_by_index(td["distance_matrix"], curr_node, dim=1, squeeze=False),
+                next_node,
+                dim=2,
+                squeeze=False,
             dist = gather_by_index(
                 gather_by_index(td["distance_matrix"], curr_node, dim=1, squeeze=False),
                 next_node,
@@ -470,7 +538,8 @@ class CVRPTWEnv(CVRPEnv):
             return instance
         return load_npz_to_tensordict(filename=name)
 
-    def extract_from_solomon(self, instance: dict, batch_size: int = 1):
+    def extract_from_solomon(self, instance: dict):
+        batch_size = 1  # we assume batch_size will always be 1 for loaded instances
         # extract parameters for the environment from the Solomon instance
         self.min_demand = instance["demand"][1:].min()
         self.max_demand = instance["demand"][1:].max()
@@ -496,6 +565,7 @@ class CVRPTWEnv(CVRPEnv):
             {
                 "locs": torch.tensor(
                     instance["node_coord"],
+                    instance["node_coord"],
                     dtype=torch.float32,
                     device=self.device,
                 ).repeat(batch_size, 1, 1),
@@ -515,6 +585,7 @@ class CVRPTWEnv(CVRPEnv):
                     device=self.device,
                 ).repeat(batch_size, 1, 1),
             },
+            batch_size=batch_size,
             batch_size=batch_size,
         )
         return self.reset(td, batch_size=batch_size)
