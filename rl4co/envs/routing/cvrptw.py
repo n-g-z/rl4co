@@ -334,7 +334,6 @@ class CVRPTWEnv(CVRPEnv):
         else:
             all_locs = td["locs"]
 
-
         # calculate distance matrix, if not available
         self.extract_distance_matrix(td)
 
@@ -448,7 +447,6 @@ class CVRPTWEnv(CVRPEnv):
     def check_solution_validity(td: TensorDict, actions: torch.Tensor):
         CVRPEnv.check_solution_validity(td, actions)
         batch_size = td["locs"].shape[0]
-
 
         # distances to depot
         distances = td["distance_matrix"][..., 0, :]
@@ -578,15 +576,3 @@ class CVRPTWEnv(CVRPEnv):
             batch_size=batch_size,
         )
         return self.reset(td, batch_size=batch_size)
-
-if __name__ == "__main__":
-    # create environment
-    env = CVRPTWEnv(num_loc=10, max_time=480, vehicle_capacity=20, scale=True)
-
-    device_str = "cuda" if torch.cuda.is_available() else "cpu"
-    device = torch.device(device_str)
-
-    from rl4co.models.zoo import POMO
-    model = POMO(env.observation_spec, env.action_spec, device=device)
-    # run environment
-    td = env.reset()
