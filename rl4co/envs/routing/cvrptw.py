@@ -123,7 +123,6 @@ class CVRPTWEnv(CVRPEnv):
                     td["distance_matrix"] = get_distance_matrix(locs=td["locs"]).to(
                         dtype=torch.float32
                     )
-        )
 
     def extract_distance_matrix(self, td: TensorDict):
         if "distance_matrix" not in td.keys():
@@ -310,10 +309,6 @@ class CVRPTWEnv(CVRPEnv):
         td: Optional[TensorDict] = None,
         batch_size: Optional[list] = None,
         reset_distances: bool = False,
-        self,
-        td: Optional[TensorDict] = None,
-        batch_size: Optional[list] = None,
-        reset_distances: bool = False,
     ) -> TensorDict:
         if reset_distances == True:
             self.distance_matrix = None
@@ -483,11 +478,6 @@ class CVRPTWEnv(CVRPEnv):
                 next_node,
                 dim=2,
                 squeeze=False,
-            dist = gather_by_index(
-                gather_by_index(td["distance_matrix"], curr_node, dim=1, squeeze=False),
-                next_node,
-                dim=2,
-                squeeze=False,
             ).reshape([batch_size, 1])
             curr_time = torch.max(
                 (curr_time + dist).int(),
@@ -586,6 +576,17 @@ class CVRPTWEnv(CVRPEnv):
                 ).repeat(batch_size, 1, 1),
             },
             batch_size=batch_size,
-            batch_size=batch_size,
         )
         return self.reset(td, batch_size=batch_size)
+
+if __name__ == "__main__":
+    # create environment
+    env = CVRPTWEnv(num_loc=10, max_time=480, vehicle_capacity=20, scale=True)
+
+    device_str = "cuda" if torch.cuda.is_available() else "cpu"
+    device = torch.device(device_str)
+
+    from rl4co.models.zoo import POMO
+    model = POMO(env.observation_spec, env.action_spec, device=device)
+    # run environment
+    td = env.reset()

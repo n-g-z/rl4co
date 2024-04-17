@@ -121,46 +121,6 @@ def get_total_distance(td: TensorDict, actions: TensorDict):
 
 
 @torch.jit.script
-def get_distances_dm(td: TensorDict, actions: TensorDict):
-    """Compute the distance between each pair of consecutive nodes
-    in the tour for a batch of tours, based on the distance matrix."""
-    batch_size = td["locs"].shape[0]
-    # add depot at front
-    actions_ordered = torch.cat(
-        [torch.zeros(batch_size, 1, dtype=torch.int32, device=td.device), actions],
-        dim=1,
-    )
-    actions_shifted = torch.roll(actions_ordered, -1, dims=-1)
-    if "distance_matrix" in td.keys():
-        distances = gather_by_index(
-            gather_by_index(td["distance_matrix"], actions_ordered, dim=1, squeeze=False),
-            actions_shifted,
-            dim=2,
-            squeeze=False,
-        ).squeeze(-1)
-    else:
-        depot = td["locs"][..., 0:1, :]
-        locs_ordered = torch.cat(
-            [
-                depot,
-                gather_by_index(td["locs"], actions).reshape(
-                    [batch_size, actions.size(-1), 2]
-                ),
-            ],
-            dim=1,
-        )
-        ordered_locs_next = torch.roll(locs_ordered, 1, dims=-2)
-        distances = get_distance(ordered_locs_next, locs_ordered)
-    return distances
-
-
-@torch.jit.script
-def get_total_distance(td: TensorDict, actions: TensorDict):
-    """Compute the total tour distance for a batch of tours based on the distance matrix."""
-    return get_distances_dm(td, actions).sum(-1)
-
-
-@torch.jit.script
 def get_tour_length(ordered_locs):
     """Compute the total tour distance for a batch of ordered tours.
     Computes the L2 norm between each pair of consecutive nodes in the tour and sums them up.
