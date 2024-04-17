@@ -21,7 +21,7 @@ def env_context_embedding(env_name: str, config: dict) -> nn.Module:
         "cvrp": VRPContext,
         "cvrptw": VRPTWContext,
         "ffsp": FFSPContext,
-        "svrp": SVRPContext,
+        "skillvrp": SkillVRPContext,
         "sdvrp": VRPContext,
         "pctsp": PCTSPContext,
         "spctsp": PCTSPContext,
@@ -173,15 +173,15 @@ class VRPTWContext(VRPContext):
         return torch.cat([capacity, current_time], -1)
 
 
-class SVRPContext(EnvContext):
-    """Context embedding for the Skill Vehicle Routing Problem (SVRP).
+class SkillVRPContext(EnvContext):
+    """Context embedding for the Skill Vehicle Routing Problem (SkillVRP).
     Project the following to the embedding space:
         - current node embedding
         - current technician
     """
 
     def __init__(self, embedding_dim):
-        super(SVRPContext, self).__init__(
+        super(SkillVRPContext, self).__init__(
             embedding_dim=embedding_dim, step_context_dim=embedding_dim
         )
 

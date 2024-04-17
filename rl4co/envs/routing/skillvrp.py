@@ -18,7 +18,7 @@ from rl4co.utils.pylogger import get_pylogger
 log = get_pylogger(__name__)
 
 
-class SVRPEnv(RL4COEnvBase):
+class SkillVRPEnv(RL4COEnvBase):
     """
     Basic Skill-VRP environment. The environment is a variant of the Capacitated Vehicle Routing Problem (CVRP).
     Each technician has a certain skill-level and each customer node requires a certain skill-level to be serviced.
@@ -37,7 +37,7 @@ class SVRPEnv(RL4COEnvBase):
         td_params (TensorDict): Parameters for the TensorDict. Default: None
     """
 
-    name = "svrp"
+    name = "skillvrp"
 
     def __init__(
         self,

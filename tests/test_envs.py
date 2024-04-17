@@ -18,7 +18,7 @@ from rl4co.envs import (
     SDVRPEnv,
     SMTWTPEnv,
     SPCTSPEnv,
-    SVRPEnv,
+    SkillVRPEnv,
     TSPEnv,
     MDCPDPEnv,
 )
@@ -35,7 +35,7 @@ warnings.filterwarnings("ignore", "Matplotlib is currently using agg")
         TSPEnv,
         CVRPEnv,
         CVRPTWEnv,
-        SVRPEnv,
+        SkillVRPEnv,
         SDVRPEnv,
         PCTSPEnv,
         SPCTSPEnv,
