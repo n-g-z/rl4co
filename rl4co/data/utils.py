@@ -1,7 +1,6 @@
 import os
 
 import numpy as np
-import vrplib
 
 from tensordict.tensordict import TensorDict
 
