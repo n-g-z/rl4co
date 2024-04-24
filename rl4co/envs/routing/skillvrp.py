@@ -2,6 +2,9 @@ from typing import Optional
 
 import torch
 
+from enum import Enum
+from pydantic import BaseModel
+from typing import List, Tuple
 from tensordict.tensordict import TensorDict
 from torchrl.data import (
     BoundedTensorSpec,
@@ -16,6 +19,57 @@ from rl4co.utils.ops import gather_by_index, get_distance
 from rl4co.utils.pylogger import get_pylogger
 
 log = get_pylogger(__name__)
+
+
+class Skill(BaseModel):
+    type: int
+    level: int = 1
+
+
+class Technician(BaseModel):
+    skills: List[Skill]
+    travel_cost: float = 1.0
+
+
+class Customer(BaseModel):
+    loc: Tuple[float, float]
+    required_skills: List[Skill]
+    time_window: Tuple[int, int]
+    service_time: int
+    precedence: List[Tuple[int, int]] = []
+
+
+class DepotLoc(Enum):
+    center = "center"
+    random = "random"
+    corner = "corner"
+
+
+class Instance(BaseModel):
+    """
+    Attributes needed to define an environment instance.
+    To not differentiate between skill levels, simply set max_skill = 1.
+    """
+
+    depot_loc: DepotLoc = DepotLoc.center
+    num_loc: int = 20
+    num_ops: int = 6
+    num_tech: int = 3
+    # min-max limits
+    min_loc: float = 0.0
+    max_loc: float = 150.0
+    min_skill: int = 1
+    max_skill: int = 10
+    min_duration: int = 10
+    max_duration: int = 30
+    system_start_time: float = 0
+    system_end_time: float = 480
+    # further definitions
+    ops_mapping: List[Tuple[int, int]] = [(2, 4), (1, 6)]
+
+
+class Presets:
+    medium_a: int
 
 
 class SkillVRPEnv(RL4COEnvBase):
@@ -41,46 +95,57 @@ class SkillVRPEnv(RL4COEnvBase):
 
     def __init__(
         self,
-        num_loc: int = 20,
-        min_loc: float = 0,
-        max_loc: float = 1,
-        min_skill: float = 1,
-        max_skill: float = 10,
-        tech_costs: list = [1, 2, 3],
+        params: Instance = Instance(),
         td_params: TensorDict = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
-        self.num_loc = num_loc
-        self.min_loc = min_loc
-        self.max_loc = max_loc
-        self.min_skill = min_skill
-        self.max_skill = max_skill
-        self.tech_costs = tech_costs
-        self.num_tech = len(tech_costs)
-        self._make_spec(td_params)
+        # assertions
+        assert (
+            sum([each[0] for each in params.ops_mapping]) == params.num_tech
+        ), "the total number of technicians mapped in ops_mapping (at position 0) must match the number of technicians defined in num_tech"
+        assert (
+            max([each[1] for each in params.ops_mapping]) <= params.num_ops
+        ), "the maximum number of operations mapped in ops_mapping (at position 1) cannot exceed the total number of operations defined in num_ops"
+        assert (
+            params.min_skill <= params.max_skill
+        ), "min_skill cannot be larger than max_skill"
+        assert params.min_loc <= params.max_loc, "min_loc cannot be larger than max_loc"
+        assert (
+            params.min_duration <= params.max_duration
+        ), "min_duration cannot be larger than max_duration"
+        self.params = params
+        # self._make_spec(td_params)
 
     def _make_spec(self, td_params: TensorDict = None):
+        # TODO redo
         """Make the observation and action specs from the parameters."""
         self.observation_spec = CompositeSpec(
             locs=BoundedTensorSpec(
-                low=self.min_loc,
-                high=self.max_loc,
-                shape=(self.num_loc + 1, 2),
+                low=self.params.min_loc,
+                high=self.params.max_loc,
+                shape=(self.params.num_loc + 1, 2),
                 dtype=torch.float32,
+            ),
+            techs=BoundedTensorSpec(
+                low=self.params.min_skill,
+                high=self.params.max_skill,
+                shape=(self.params.num_tech, self.params.num_ops),
+                dtype=torch.int64,
             ),
             current_node=UnboundedDiscreteTensorSpec(
                 shape=(1),
                 dtype=torch.int64,
             ),
-            skills=BoundedTensorSpec(
-                low=self.min_skill,
-                high=self.max_skill,
-                shape=(self.num_loc, 1),
+            # TODO include time window and service durations
+            skill_demand=BoundedTensorSpec(
+                low=self.params.min_skill,
+                high=self.params.max_skill,
+                shape=(self.params.num_loc, 1),
                 dtype=torch.float32,
             ),
             action_mask=UnboundedDiscreteTensorSpec(
-                shape=(self.num_loc + 1, 1),
+                shape=(self.params.num_loc + 1, 1),
                 dtype=torch.bool,
             ),
             shape=(),
@@ -89,43 +154,76 @@ class SkillVRPEnv(RL4COEnvBase):
             shape=(1,),
             dtype=torch.int64,
             low=0,
-            high=self.num_loc + 1,
+            high=self.params.num_loc + 1,
         )
         self.reward_spec = UnboundedContinuousTensorSpec(shape=(1,), dtype=torch.float32)
         self.done_spec = UnboundedDiscreteTensorSpec(shape=(1,), dtype=torch.bool)
 
     def generate_data(self, batch_size):
-        """Generate data for the basic Skill-VRP. The data consists of the locations of the customers,
-        the skill-levels of the technicians and the required skill-levels of the customers.
+        """Generate data for the basic Skill-VRP. The data consists of the following:
+        (1) the locations of the customers and depot,
+        (2) the technicians offering services, each with a certain skill type and level,
+        (3) the required skills (type and level) of the customers,
+        (4) the time windows in which the customers need to be serviced.
         The data is generated randomly within the given bounds."""
         # Batch size input check
         batch_size = [batch_size] if isinstance(batch_size, int) else batch_size
 
-        # Initialize the locations (including the depot which is always the first node)
-        locs_with_depot = (
-            torch.FloatTensor(*batch_size, self.num_loc + 1, 2)
-            .uniform_(self.min_loc, self.max_loc)
-            .to(self.device)
+        # (1) Locations
+        # depot
+        if self.params.depot_loc == DepotLoc.center:
+            depot = torch.tensor(
+                [[self.params.max_loc / 2, self.params.max_loc / 2]]
+            ).expand(*batch_size, 1, 2)
+        elif self.params.depot_loc == DepotLoc.corner:
+            depot = torch.tensor([[0, 0]]).expand(*batch_size, 1, 2)
+        else:
+            depot = torch.FloatTensor(*batch_size, 1, 2).uniform_(
+                self.params.min_loc, self.params.max_loc
+            )
+        # customer locations
+        customer_locs = torch.FloatTensor(*batch_size, self.params.num_loc, 2).uniform_(
+            self.params.min_loc, self.params.max_loc
         )
+        # # merge locs together
+        locs = torch.cat((depot, customer_locs), -2).to(device=self.device)
 
-        # Initialize technicians and sort ascendingly
-        techs, _ = torch.sort(
-            torch.FloatTensor(*batch_size, self.num_tech, 1)
-            .uniform_(self.min_skill, self.max_skill)
-            .to(self.device),
-            dim=-2,
+        # (2) Technicians
+        techs = torch.randint(
+            low=self.params.min_skill,
+            high=self.params.max_skill + 1,  # the interval is not inclusive
+            size=(*batch_size, self.params.num_tech, self.params.num_ops),
+            device=self.device,
         )
+        # consider ops_mapping
+        idx = 0
+        for mapping in self.params.ops_mapping:
+            techs[:, idx : mapping[0], mapping[1] :] = 0
+            idx += mapping[0]
+        max_skills = torch.max(
+            techs, dim=-1
+        )  # this will be the maximum available to the customers
+        # TODO travel costs for technicians, depending on skill level
+
+        # # Initialize technicians and sort ascendingly
+        # techs, _ = torch.sort(
+        #     torch.FloatTensor(*batch_size, self.params.num_tech, 1)
+        #     .uniform_(self.params.min_skill, self.params.max_skill)
+        #     .to(device=self.device),
+        #     dim=-2,
+        # )
 
         # Initialize the skills
-        skills = (
-            torch.FloatTensor(*batch_size, self.num_loc, 1).uniform_(0, 1).to(self.device)
-        )
-        # scale skills
-        skills = torch.max(techs, dim=1, keepdim=True).values * skills
+        # skills = (
+        #     torch.FloatTensor(*batch_size, self.params.num_loc, 1)
+        #     .uniform_(0, 1)
+        #     .to(device=self.device)
+        # )
+        # # scale skills
+        # skills = torch.max(techs, dim=1, keepdim=True).values * skills
         td = TensorDict(
             {
-                "locs": locs_with_depot[..., 1:, :],
-                "depot": locs_with_depot[..., 0, :],
+                "locs": locs,
                 "techs": techs,
                 "skills": skills,
             },
@@ -197,7 +295,7 @@ class SkillVRPEnv(RL4COEnvBase):
         # Create reset TensorDict
         td_reset = TensorDict(
             {
-                "locs": torch.cat((td["depot"][:, None, :], td["locs"]), -2),
+                "locs": td["locs"],
                 "techs": td["techs"],
                 "skills": td["skills"],
                 "current_node": torch.zeros(
@@ -244,16 +342,16 @@ class SkillVRPEnv(RL4COEnvBase):
         batch = 0
         for each in indices:
             if each[0] > batch:
-                costs[batch, start:] = self.tech_costs[tech]
+                costs[batch, start:] = self.tparams.ech_costs[tech]
                 start = tech = 0
                 batch = each[0]
             end = (
                 each[-1] + 1
             )  # indices in locs_ordered are shifted by one due to added depot in the front
-            costs[batch, start:end] = self.tech_costs[tech]
+            costs[batch, start:end] = self.params.tech_costs[tech]
             tech += 1
             start = end
-        costs[batch, start:] = self.tech_costs[tech]
+        costs[batch, start:] = self.params.tech_costs[tech]
 
         travel_to = torch.roll(locs_ordered, -1, dims=-2)
         distances = get_distance(locs_ordered, travel_to)
@@ -395,3 +493,8 @@ class SkillVRPEnv(RL4COEnvBase):
                 annotation_clip=False,
             )
         plt.show()
+
+
+if __name__ == "__main__":
+    env = SkillVRPEnv(batch_size=[3])
+    env.reset()
