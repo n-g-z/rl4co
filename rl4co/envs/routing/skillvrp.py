@@ -49,6 +49,9 @@ class Instance(BaseModel):
     """
     Attributes needed to define an environment instance.
     To not differentiate between skill levels, simply set max_skill = 1.
+    ops_mapping is a list of tuples of shape (a, b, c),
+    where a is the number of technicians (int) that can provide b skills (int)
+    and have travel costs c (float). -> This modelling does not differentiate travel costs for skill levels yet.
     """
 
     depot_loc: DepotLoc = DepotLoc.center
@@ -65,7 +68,7 @@ class Instance(BaseModel):
     system_start_time: float = 0
     system_end_time: float = 480
     # further definitions
-    ops_mapping: List[Tuple[int, int]] = [(2, 4), (1, 6)]
+    ops_mapping: List[Tuple[int, int, float]] = [(2, 4, 1.0), (1, 6, 2.0)]
 
 
 class Presets:
@@ -195,11 +198,14 @@ class SkillVRPEnv(RL4COEnvBase):
             size=(*batch_size, self.params.num_tech, self.params.num_ops),
             device=self.device,
         )
+        travel_cost = torch.ones(*batch_size, self.params.num_tech, 1)
         # consider ops_mapping
         idx = 0
         for mapping in self.params.ops_mapping:
-            techs[:, idx : mapping[0], mapping[1] :] = 0
+            techs[:, idx : idx + mapping[0], mapping[1] :] = 0
+            travel_cost[:, idx : idx + mapping[0], :] = mapping[2]
             idx += mapping[0]
+
         max_skills = torch.max(
             techs, dim=-1
         )  # this will be the maximum available to the customers
@@ -225,7 +231,7 @@ class SkillVRPEnv(RL4COEnvBase):
             {
                 "locs": locs,
                 "techs": techs,
-                "skills": skills,
+                # "skills": skills,
             },
             batch_size=batch_size,
             device=self.device,
