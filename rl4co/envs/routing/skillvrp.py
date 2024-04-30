@@ -209,7 +209,9 @@ class SkillVRPEnv(RL4COEnvBase):
         max_skills = torch.max(
             techs, dim=-1
         )  # this will be the maximum available to the customers
+
         # TODO travel costs for technicians, depending on skill level
+        travel_cost = None
 
         # # Initialize technicians and sort ascendingly
         # techs, _ = torch.sort(
