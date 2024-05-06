@@ -67,8 +67,17 @@ class Instance(BaseModel):
     max_duration: int = 30
     system_start_time: float = 0
     system_end_time: float = 480
+    tw_ratio: float = 0.2
     # further definitions
-    ops_mapping: List[Tuple[int, int, float]] = [(2, 4, 1.0), (1, 6, 2.0)]
+    tech_mapping: List[Tuple[int, int, float]] = [
+        (2, 4, 1.0),
+        (1, 6, 2.0),
+    ]  # [(num_tech, num_ops, travel_cost)]
+    cust_mapping: List[Tuple[int, int]] = [
+        (10, 1),
+        (10, 3),
+    ]  # [(num_cust, num_ops)]
+    tw_mapping: List[Tuple[float, int, int]] = [(0.5, 0, 240), (0.5, 240, 480)]
 
 
 class Presets:
@@ -105,10 +114,10 @@ class SkillVRPEnv(RL4COEnvBase):
         super().__init__(**kwargs)
         # assertions
         assert (
-            sum([each[0] for each in params.ops_mapping]) == params.num_tech
+            sum([each[0] for each in params.tech_mapping]) == params.num_tech
         ), "the total number of technicians mapped in ops_mapping (at position 0) must match the number of technicians defined in num_tech"
         assert (
-            max([each[1] for each in params.ops_mapping]) <= params.num_ops
+            max([each[1] for each in params.tech_mapping]) <= params.num_ops
         ), "the maximum number of operations mapped in ops_mapping (at position 1) cannot exceed the total number of operations defined in num_ops"
         assert (
             params.min_skill <= params.max_skill
@@ -201,39 +210,56 @@ class SkillVRPEnv(RL4COEnvBase):
         travel_cost = torch.ones(*batch_size, self.params.num_tech, 1)
         # consider ops_mapping
         idx = 0
-        for mapping in self.params.ops_mapping:
+        for mapping in self.params.tech_mapping:
             techs[:, idx : idx + mapping[0], mapping[1] :] = 0
             travel_cost[:, idx : idx + mapping[0], :] = mapping[2]
             idx += mapping[0]
 
         max_skills = torch.max(
-            techs, dim=-1
-        )  # this will be the maximum available to the customers
+            techs, dim=1
+        ).values  # this will be the maximum available to the customers
 
-        # TODO travel costs for technicians, depending on skill level
-        travel_cost = None
+        # (3) Required skills
+        skills = (
+            torch.rand((*batch_size, self.params.num_loc, self.params.num_ops))
+            * (max_skills[:, None, :] - self.params.min_skill)
+            + self.params.min_skill
+        ).round()
+        mask = torch.full_like(skills, False, dtype=torch.bool)
+        # consider cust_mapping: how many operations does each customer require
+        idx = 0
+        for mapping in self.params.cust_mapping:
+            slice = skills[:, idx : idx + mapping[0], :]
+            random_tensor = torch.rand_like(slice)
+            _, indices = torch.topk(random_tensor, mapping[1], dim=-1)
+            slice_mask = torch.full_like(slice, False)
+            slice_mask.scatter_(dim=2, index=indices, value=True)
+            mask[:, idx : idx + mapping[0], :] = slice_mask
+            idx += mapping[0]
+        skills[~mask] = 0
 
-        # # Initialize technicians and sort ascendingly
-        # techs, _ = torch.sort(
-        #     torch.FloatTensor(*batch_size, self.params.num_tech, 1)
-        #     .uniform_(self.params.min_skill, self.params.max_skill)
-        #     .to(device=self.device),
-        #     dim=-2,
-        # )
+        # (4) Time windows
+        # X% of the customers require that their operation starts in a given time window
+        time_windows = torch.cat(
+            [torch.zeros((3, 20, 1)), torch.full((3, 20, 1), float("inf"))], dim=-1
+        )
+        if self.params.tw_ratio > 0:
+            time_windows[:, :, 0] = self.params.system_start_time
+            time_windows[:, :, 1] = self.params.system_end_time
+            start = end = 0
+            for i, mapping in enumerate(self.params.tw_mapping):
+                end += int(self.params.tw_ratio * mapping[0] * self.params.num_loc)
+                time_windows[:, start:end, 0] = mapping[1]
+                time_windows[:, start:end, 1] = mapping[2]
+                start = end
 
-        # Initialize the skills
-        # skills = (
-        #     torch.FloatTensor(*batch_size, self.params.num_loc, 1)
-        #     .uniform_(0, 1)
-        #     .to(device=self.device)
-        # )
-        # # scale skills
-        # skills = torch.max(techs, dim=1, keepdim=True).values * skills
         td = TensorDict(
             {
                 "locs": locs,
+                "skills": skills,
                 "techs": techs,
-                # "skills": skills,
+                "time_windows": time_windows,
+                "travel_cost": travel_cost,
             },
             batch_size=batch_size,
             device=self.device,
@@ -248,13 +274,13 @@ class SkillVRPEnv(RL4COEnvBase):
         (because every customer node needs to be visited).
         """
         batch_size = td["locs"].shape[0]
-        # check skill level
-        current_tech_skill = gather_by_index(td["techs"], td["current_tech"]).reshape(
-            [batch_size, 1]
-        )
+        # (1) check skill level
+        current_tech_skill = td["techs"][torch.arange(batch_size), td["current_tech"]]
         can_service = td["skills"] <= current_tech_skill.unsqueeze(1).expand_as(
             td["skills"]
         )
+        # (2) TODO can_reach_in_time
+
         mask_loc = td["visited"][..., 1:, :].to(can_service.dtype) | ~can_service
         # Cannot visit the depot if there are still unserved nodes and I either just visited the depot or am the last technician
         mask_depot = (
@@ -303,17 +329,21 @@ class SkillVRPEnv(RL4COEnvBase):
         # Create reset TensorDict
         td_reset = TensorDict(
             {
+                # keep some values
                 "locs": td["locs"],
-                "techs": td["techs"],
                 "skills": td["skills"],
+                "techs": td["techs"],
+                "time_windows": td["time_windows"],
+                "travel_cost": td["travel_cost"],
+                # reset others
                 "current_node": torch.zeros(
-                    *batch_size, 1, dtype=torch.long, device=self.device
+                    size=(*batch_size, 1), dtype=torch.long, device=self.device
                 ),
                 "current_tech": torch.zeros(
-                    *batch_size, 1, dtype=torch.long, device=self.device
+                    size=(*batch_size,), dtype=torch.long, device=self.device
                 ),
                 "visited": torch.zeros(
-                    (*batch_size, td["locs"].shape[-2] + 1, 1),
+                    size=(*batch_size, td["locs"].shape[-2] + 1, 1),
                     dtype=torch.uint8,
                     device=self.device,
                 ),
