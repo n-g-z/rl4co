@@ -124,25 +124,6 @@ class CVRPTWEnv(CVRPEnv):
                         dtype=torch.float32
                     )
 
-    def extract_distance_matrix(self, td: TensorDict):
-        if "distance_matrix" not in td.keys():
-            if self.distance_matrix is not None:
-                if self.distance_matrix.shape[0] == td["locs"].shape[0]:
-                    td["distance_matrix"] = self.distance_matrix.to(dtype=torch.float32)
-                elif self.distance_matrix.shape[0] == 1:
-                    td["distance_matrix"] = self.distance_matrix.to(
-                        dtype=torch.float32
-                    ).expand(td["locs"].shape[0], -1, -1)
-            else:
-                if "depot" in td.keys():
-                    td["distance_matrix"] = get_distance_matrix(
-                        locs=torch.cat((td["depot"][..., None, :], td["locs"]), -2)
-                    ).to(dtype=torch.float32)
-                else:
-                    td["distance_matrix"] = get_distance_matrix(locs=td["locs"]).to(
-                        dtype=torch.float32
-                    )
-
     def generate_data(self, batch_size) -> TensorDict:
         """
         Generates time windows and service durations for the locations. The depot has a time window of [0, self.max_time].
@@ -161,9 +142,6 @@ class CVRPTWEnv(CVRPEnv):
         )
 
         ## define time windows
-        # 1. get distances from depot (we don't necessarily have the distance matrix in td yet)
-        self.extract_distance_matrix(td)
-        dist = td["distance_matrix"][..., 0, :]
         # 1. get distances from depot (we don't necessarily have the distance matrix in td yet)
         self.extract_distance_matrix(td)
         dist = td["distance_matrix"][..., 0, :]
@@ -238,9 +216,6 @@ class CVRPTWEnv(CVRPEnv):
         dist = gather_by_index(
             td["distance_matrix"], td["current_node"], dim=1, squeeze=False
         ).squeeze(1)
-        dist = gather_by_index(
-            td["distance_matrix"], td["current_node"], dim=1, squeeze=False
-        ).squeeze(1)
         can_reach_in_time = (
             td["current_time"] + dist <= td["time_windows"][..., 1]
         )  # I only need to start the service before the time window ends, not finish it.
@@ -277,17 +252,6 @@ class CVRPTWEnv(CVRPEnv):
             dim=2,
             squeeze=False,
         ).reshape([batch_size, 1])
-        distance = gather_by_index(
-            gather_by_index(
-                td["distance_matrix"],
-                td["current_node"],
-                dim=1,
-                squeeze=False,
-            ),
-            td["action"],
-            dim=2,
-            squeeze=False,
-        ).reshape([batch_size, 1])
         duration = gather_by_index(td["durations"], td["action"]).reshape([batch_size, 1])
         start_times = gather_by_index(td["time_windows"], td["action"])[..., 0].reshape(
             [batch_size, 1]
@@ -310,11 +274,7 @@ class CVRPTWEnv(CVRPEnv):
         batch_size: Optional[list] = None,
         reset_distances: bool = False,
     ) -> TensorDict:
-        if reset_distances == True:
-            self.distance_matrix = None
-            if td is not None and "distance_matrix" in td.keys():
-                td.pop("distance_matrix")
-        if reset_distances == True:
+        if reset_distances:
             self.distance_matrix = None
             if td is not None and "distance_matrix" in td.keys():
                 td.pop("distance_matrix")
@@ -377,10 +337,6 @@ class CVRPTWEnv(CVRPEnv):
                 ),
             },
             batch_size=batch_size,
-        )
-        td_reset.set(
-            "action_mask",
-            self.get_action_mask(td_reset),
         )
         td_reset.set(
             "action_mask",
@@ -451,8 +407,6 @@ class CVRPTWEnv(CVRPEnv):
         # distances to depot
         distances = td["distance_matrix"][..., 0, :]
 
-        distances = td["distance_matrix"][..., 0, :]
-
         # basic checks on time windows
         assert torch.all(distances >= 0.0), "Distances must be non-negative."
         assert torch.all(td["time_windows"] >= 0.0), "Time windows must be non-negative."
@@ -507,12 +461,12 @@ class CVRPTWEnv(CVRPEnv):
     @staticmethod
     def load_data(
         name: str,
-        solomon=False,
+        solomon: bool = False,
         path_instances: str = None,
         type: str = None,
         compute_edge_weights: bool = False,
     ):
-        if solomon == True:
+        if solomon:
             assert type in [
                 "instance",
                 "solution",
@@ -552,7 +506,6 @@ class CVRPTWEnv(CVRPEnv):
         td = TensorDict(
             {
                 "locs": torch.tensor(
-                    instance["node_coord"],
                     instance["node_coord"],
                     dtype=torch.float32,
                     device=self.device,
