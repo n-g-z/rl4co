@@ -297,6 +297,7 @@ class SkillVRPEnv(RL4COEnvBase):
         can_service = (
             td["skills"] <= current_tech_skill.unsqueeze(1).expand_as(td["skills"])
         ).all(dim=-1)
+
         # (2) check time windows
         can_reach_in_time = (
             td["current_time"] + dist <= td["time_windows"][..., 1]
@@ -306,7 +307,7 @@ class SkillVRPEnv(RL4COEnvBase):
         visited = td["visited"].to(can_service.dtype)
 
         # (4) combine all conditions
-        can_visit = can_service & can_reach_in_time & ~visited.squeeze(-1)
+        can_visit = can_service & can_reach_in_time & ~visited
 
         # (5) mask depot
         can_visit[:, 0] = ~((td["current_node"] == 0) & (can_visit[:, 1:].sum(-1) > 0))
@@ -317,13 +318,13 @@ class SkillVRPEnv(RL4COEnvBase):
         """Step function for the Skill-VRP. If a technician returns to the depot, the next technician is sent out.
         The visited node is marked as visited. The reward is set to zero and the done flag is set if all nodes have been visited.
         """
-        current_node = td["action"][:, None]  # Add dimension for step
+        current_node = td["action"]  # Add dimension for step
 
         # if I go back to the depot, send out next technician
         td["current_tech"] += (current_node == 0).int()
 
         # Add one dimension since we write a single value
-        visited = td["visited"].scatter(-2, current_node[..., None], 1)
+        visited = td["visited"].scatter(-1, current_node[..., None], 1)
 
         # SECTION: get done
         done = visited.sum(-2) == visited.size(-2)
@@ -371,7 +372,7 @@ class SkillVRPEnv(RL4COEnvBase):
                     size=(*batch_size,), dtype=torch.long, device=self.device
                 ),
                 "visited": torch.zeros(
-                    size=(*batch_size, td["locs"].shape[-2], 1),
+                    size=(*batch_size, td["locs"].shape[-2]),
                     dtype=torch.uint8,
                     device=self.device,
                 ),
@@ -562,7 +563,70 @@ class SkillVRPEnv(RL4COEnvBase):
 
 
 if __name__ == "__main__":
-    env = SkillVRPEnv(batch_size=[3])
+
+    def rollout(env, td, policy, max_steps: int = None):
+        """Helper function to rollout a policy. Currently, TorchRL does not allow to step
+        over envs when done with `env.rollout()`. We need this because for environments that complete at different steps.
+        """
+
+        max_steps = float("inf") if max_steps is None else max_steps
+        actions = []
+        steps = 0
+
+        while not td["done"].all():
+            td = policy(td)
+            actions.append(td["action"])
+            td = env.step(td)["next"]
+            steps += 1
+            if steps > max_steps:
+                print("Max steps reached")
+                break
+        return torch.stack(actions, dim=1)
+
+    # Simple heuristics (nearest neighbor + capacity check)
+    def greedy_policy(td):
+        """Select closest available action"""
+        available_actions = td["action_mask"]
+        # distances
+        cost_matrix = td["cost_matrix"]
+        current_action = td["current_node"]
+        idx_batch = torch.arange(cost_matrix.size(0))
+        distances_next = cost_matrix[idx_batch, current_action]
+        distances_next[~available_actions.bool()] = float("inf")
+        # do not select depot if some capacity is left
+        distances_next[:, 0] = (
+            float("inf") * (td["used_capacity_linehaul"] < td["vehicle_capacity"]).float()
+        ).squeeze(-1)
+        # # if sum of available actions is 0, select depot
+        # distances_next[available_actions.sum(-1) == 0, 0] = 0
+        action = torch.argmin(distances_next, dim=-1)
+        td.set("action", action)
+        return td
+
+    # Totally random policy selecting any available action
+    def random_policy(td):
+        """Helper function to select a random action from available actions"""
+        action = torch.multinomial(td["action_mask"].float(), 1).squeeze(-1)
+        # print(action)
+        td.set("action", action)
+        return td
+
+    batch_size = 3
+
+    env = SkillVRPEnv(batch_size=[batch_size])
+
     td = env.reset()
     action_mask = env.get_action_mask(td)
     print("action_mask: ", action_mask)
+
+    actions_random = rollout(env, td.clone(), random_policy)
+    actions = rollout(env, td.clone(), greedy_policy)
+
+    env.check_solution_validity(td, actions_random)
+    env.check_solution_validity(td, actions)
+
+    reward_random = env.get_reward(td, actions_random)
+    reward_greedy = env.get_reward(td, actions)
+
+    print("Reward random: ", reward_random)
+    print("Reward greedy: ", reward_greedy)
