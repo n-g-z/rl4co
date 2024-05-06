@@ -237,18 +237,31 @@ class SkillVRPEnv(RL4COEnvBase):
             mask[:, idx : idx + mapping[0], :] = slice_mask
             idx += mapping[0]
         skills[~mask] = 0
+        # add empty skill for depot
+        skills = torch.cat(
+            [
+                torch.zeros((*batch_size, 1, self.params.num_ops)),
+                skills,
+            ],
+            dim=1,
+        )
 
         # (4) Time windows
         # X% of the customers require that their operation starts in a given time window
         time_windows = torch.cat(
-            [torch.zeros((3, 20, 1)), torch.full((3, 20, 1), float("inf"))], dim=-1
+            [
+                torch.zeros((*batch_size, self.params.num_loc + 1, 1)),
+                torch.full((*batch_size, self.params.num_loc + 1, 1), float("inf")),
+            ],
+            dim=-1,
         )
         if self.params.tw_ratio > 0:
             time_windows[:, :, 0] = self.params.system_start_time
             time_windows[:, :, 1] = self.params.system_end_time
-            start = end = 0
+            start = end = 1
             for i, mapping in enumerate(self.params.tw_mapping):
                 end += int(self.params.tw_ratio * mapping[0] * self.params.num_loc)
+                assert end >= start, "Time window mapping is not valid"
                 time_windows[:, start:end, 0] = mapping[1]
                 time_windows[:, start:end, 1] = mapping[2]
                 start = end
@@ -274,19 +287,31 @@ class SkillVRPEnv(RL4COEnvBase):
         (because every customer node needs to be visited).
         """
         batch_size = td["locs"].shape[0]
+        dist = get_distance(
+            td["locs"][torch.arange(batch_size), td["current_node"]],
+            td["locs"].transpose(0, 1),
+        ).transpose(0, 1)
+
         # (1) check skill level
         current_tech_skill = td["techs"][torch.arange(batch_size), td["current_tech"]]
-        can_service = td["skills"] <= current_tech_skill.unsqueeze(1).expand_as(
-            td["skills"]
-        )
-        # (2) TODO can_reach_in_time
+        can_service = (
+            td["skills"] <= current_tech_skill.unsqueeze(1).expand_as(td["skills"])
+        ).all(dim=-1)
+        # (2) check time windows
+        can_reach_in_time = (
+            td["current_time"] + dist <= td["time_windows"][..., 1]
+        )  # I only need to start the service before the time window ends, not finish it.
 
-        mask_loc = td["visited"][..., 1:, :].to(can_service.dtype) | ~can_service
-        # Cannot visit the depot if there are still unserved nodes and I either just visited the depot or am the last technician
-        mask_depot = (
-            (td["current_node"] == 0) | (td["current_tech"] == td["techs"].size(-2) - 1)
-        ) & ((mask_loc == 0).int().sum(-2) > 0)
-        return ~torch.cat((mask_depot[..., None], mask_loc), -2).squeeze(-1)
+        # (3) check if node has been visited
+        visited = td["visited"].to(can_service.dtype)
+
+        # (4) combine all conditions
+        can_visit = can_service & can_reach_in_time & ~visited.squeeze(-1)
+
+        # (5) mask depot
+        can_visit[:, 0] = ~((td["current_node"] == 0) & (can_visit[:, 1:].sum(-1) > 0))
+
+        return can_visit
 
     def _step(self, td: TensorDict) -> torch.Tensor:
         """Step function for the Skill-VRP. If a technician returns to the depot, the next technician is sent out.
@@ -336,14 +361,17 @@ class SkillVRPEnv(RL4COEnvBase):
                 "time_windows": td["time_windows"],
                 "travel_cost": td["travel_cost"],
                 # reset others
+                "current_time": torch.zeros(
+                    *batch_size, 1, dtype=torch.float32, device=self.device
+                ),
                 "current_node": torch.zeros(
-                    size=(*batch_size, 1), dtype=torch.long, device=self.device
+                    size=(*batch_size,), dtype=torch.long, device=self.device
                 ),
                 "current_tech": torch.zeros(
                     size=(*batch_size,), dtype=torch.long, device=self.device
                 ),
                 "visited": torch.zeros(
-                    size=(*batch_size, td["locs"].shape[-2] + 1, 1),
+                    size=(*batch_size, td["locs"].shape[-2], 1),
                     dtype=torch.uint8,
                     device=self.device,
                 ),
@@ -535,4 +563,6 @@ class SkillVRPEnv(RL4COEnvBase):
 
 if __name__ == "__main__":
     env = SkillVRPEnv(batch_size=[3])
-    env.reset()
+    td = env.reset()
+    action_mask = env.get_action_mask(td)
+    print("action_mask: ", action_mask)
