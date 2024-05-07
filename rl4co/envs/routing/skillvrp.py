@@ -67,6 +67,8 @@ class Instance(BaseModel):
     max_duration: int = 30
     system_start_time: float = 0
     system_end_time: float = 480
+    # system parameters
+    penalty_term: Optional[float] = None
     tw_ratio: float = 0.2
     # further definitions
     tech_mapping: List[Tuple[int, int, float]] = [
@@ -77,7 +79,10 @@ class Instance(BaseModel):
         (10, 1),
         (10, 3),
     ]  # [(num_cust, num_ops)]
-    tw_mapping: List[Tuple[float, int, int]] = [(0.5, 0, 240), (0.5, 240, 480)]
+    tw_mapping: List[Tuple[float, int, int]] = [
+        (0.5, 0, 240),
+        (0.5, 240, 480),
+    ]  # [(ratio, start, end)]
 
 
 class Presets:
@@ -237,6 +242,9 @@ class SkillVRPEnv(RL4COEnvBase):
             mask[:, idx : idx + mapping[0], :] = slice_mask
             idx += mapping[0]
         skills[~mask] = 0
+        # shuffle skills order (on dimension 1)
+        perm = torch.randperm(skills.size(1))
+        skills = skills[:, perm]
         # add empty skill for depot
         skills = torch.cat(
             [
@@ -247,7 +255,7 @@ class SkillVRPEnv(RL4COEnvBase):
         )
 
         # (4) Time windows
-        # X% of the customers require that their operation starts in a given time window
+        # X% of the customers (tw_ratio) require that their operation starts in a given time window (defined in tw_mapping)
         time_windows = torch.cat(
             [
                 torch.zeros((*batch_size, self.params.num_loc + 1, 1)),
@@ -266,9 +274,20 @@ class SkillVRPEnv(RL4COEnvBase):
                 time_windows[:, start:end, 1] = mapping[2]
                 start = end
 
+        # (5) service times
+        # TODO: add service times
+
+        # (6) penalty term
+        if self.params.penalty_term is None:
+            penalty_term = torch.full((*batch_size,), float("nan"))
+        else:
+            penalty_term = torch.full((*batch_size,), self.params.penalty_term)
+
         td = TensorDict(
             {
                 "locs": locs,
+                "max_loc": torch.full((*batch_size,), self.params.max_loc),
+                "penalty_term": penalty_term,
                 "skills": skills,
                 "techs": techs,
                 "time_windows": time_windows,
@@ -380,6 +399,8 @@ class SkillVRPEnv(RL4COEnvBase):
             {
                 # keep some values
                 "locs": td["locs"],
+                "max_loc": td["max_loc"],
+                "penalty_term": td["penalty_term"],
                 "skills": td["skills"],
                 "techs": td["techs"],
                 "time_windows": td["time_windows"],
@@ -407,45 +428,53 @@ class SkillVRPEnv(RL4COEnvBase):
 
     def get_reward(self, td: TensorDict, actions: TensorDict) -> TensorDict:
         """Calculated the reward, where the reward is the negative total travel cost of the technicians.
-        The travel cost depends on the skill-level of the technician."""
+        The travel cost depends on the technician and is defined in tech_mapping."""
         # Check that the solution is valid
         if self.check_solution:
             self.check_solution_validity(td, actions)
 
-        # Gather dataset in order of tour
+        # (1) Gather dataset in order of tour
         batch_size = td["locs"].shape[0]
-        depot = td["locs"][..., 0:1, :]
-        locs_ordered = torch.cat(
-            [
-                depot,
-                gather_by_index(td["locs"], actions).reshape(
-                    [batch_size, actions.size(-1), 2]
-                ),
-            ],
+        go_from = torch.cat(
+            (
+                torch.zeros(batch_size, 1),
+                actions,
+            ),
             dim=1,
+        ).to(dtype=torch.int64)
+        go_to = torch.roll(go_from, shifts=-1).to(dtype=torch.int64)
+        distances = get_distance(
+            gather_by_index(td["locs"], go_from, squeeze=False),
+            gather_by_index(td["locs"], go_to, squeeze=False),
         )
 
-        # calculate travelling costs depending on the technicians' skill level
-        costs = torch.zeros(batch_size, locs_ordered.size(-2), device=self.device)
-        indices = torch.nonzero(actions == 0)
-        start = tech = 0
-        batch = 0
-        for each in indices:
-            if each[0] > batch:
-                costs[batch, start:] = self.tparams.ech_costs[tech]
-                start = tech = 0
-                batch = each[0]
-            end = (
-                each[-1] + 1
-            )  # indices in locs_ordered are shifted by one due to added depot in the front
-            costs[batch, start:end] = self.params.tech_costs[tech]
-            tech += 1
-            start = end
-        costs[batch, start:] = self.params.tech_costs[tech]
+        # (2) calculate travelling costs depending on the technicians' skill level
+        travel_cost = torch.zeros_like(distances)
+        current_tech = torch.zeros(batch_size, dtype=torch.int64, device=self.device)
+        num_routes = torch.zeros(batch_size, dtype=torch.int64, device=self.device)
+        for ii in range(distances.size(-1)):
+            travel_cost[:, ii] = td["travel_cost"][
+                torch.arange(batch_size), current_tech
+            ].squeeze(-1)
+            current_tech += (go_to[:, ii] == 0).int()
+            current_tech = current_tech * (current_tech < td["techs"].size(1)).int()
+            # count up num_routes if starting a new route (i.e. not staying at depot)
+            num_routes += (go_to[:, ii] == 0).int() * (go_from[:, ii] != 0).int()
 
-        travel_to = torch.roll(locs_ordered, -1, dims=-2)
-        distances = get_distance(locs_ordered, travel_to)
-        return -(distances * costs).sum(-1)
+        # (3) penalty for invalid solutions
+        # too many routes (may include further scenarios later on)
+        num_techs = td["techs"].size(1)
+        if td["penalty_term"].isnan().any():
+            penalty = torch.zeros_like(num_routes)
+        else:
+            penalty = (
+                (num_routes - num_techs)
+                * (num_routes > num_techs)
+                * td["penalty_term"]
+                * td["max_loc"]
+            )
+
+        return -(distances * travel_cost).sum(-1) - penalty
 
     @staticmethod
     def check_solution_validity(td: TensorDict, actions: torch.Tensor):
@@ -454,7 +483,7 @@ class SkillVRPEnv(RL4COEnvBase):
         graph_size -= 1  # remove depot
         sorted_pi = actions.data.sort(1).values
 
-        # Sorting it should give all zeros at front and then 1...n
+        # (1) Check that all nodes (except depot) are visited exactly once
         assert (
             torch.arange(1, graph_size + 1, out=sorted_pi.data.new())
             .view(1, -1)
@@ -462,19 +491,40 @@ class SkillVRPEnv(RL4COEnvBase):
             == sorted_pi[:, -graph_size:]
         ).all() and (sorted_pi[:, :-graph_size] == 0).all(), "Invalid tour"
 
-        # make sure all required skill levels are met
-        indices = torch.nonzero(actions == 0)
-        skills_ordered = gather_by_index(td["skills"], actions)
-        batch = start = tech = 0
-        for each in indices:
-            if each[0] > batch:
-                start = tech = 0
-                batch = each[0]
-            assert (
-                skills_ordered[batch, start : each[1]] <= td["techs"][batch, tech]
-            ).all(), "Skill level not met"
-            start = each[1] + 1  # skip the depot
-            tech += 1
+        # (2) make sure all required skill levels are met
+        current_tech = torch.zeros(batch_size, dtype=torch.int64, device=td.device)
+        skills_ordered = gather_by_index(td["skills"], actions, squeeze=False).to(
+            dtype=torch.int64
+        )
+        tech_skills = torch.zeros_like(skills_ordered)
+        techs = torch.zeros_like(actions)
+        for ii in range(actions.size(-1)):
+            current_tech += (actions[:, ii] == 0).int()
+            # (3) check the number of routes does not exceed the number of technicians
+            # if a penalty term is defined, we allow for additional routes, but pay a penalty in get_reward()
+            if td["penalty_term"].isnan().any():  # same value for all batches
+                assert (current_tech < td["techs"].size(1)).all(), "Too many routes"
+            else:
+                current_tech = current_tech * (current_tech < td["techs"].size(1)).int()
+            techs[:, ii] = current_tech
+            tech_skills[:, ii] = td["techs"][torch.arange(batch_size), current_tech, :]
+        assert (skills_ordered <= tech_skills).all(), "Skill level not met"
+
+        # # (3) check the number of routes does not exceed the number of technicians
+        # if td["penalty_term"].isnan().any():
+        #     for ii in range(actions.size(-1)):
+        #         current_tech += (actions[:, ii] == 0).int()
+        #     for action_seq in actions:
+        #         mask = (action_seq != torch.cat([action_seq[1:], action_seq[:1]])) | (
+        #             action_seq != 0
+        #         )
+        #         trimmed_action = action_seq[mask]
+        #         last_nonzero = (action_seq != 0).nonzero().max()
+        #         trimmed_action = trimmed_action[: last_nonzero + 1]
+        #         assert (trimmed_action == 0).sum() < td["techs"].size(
+        #             1
+        #         ), "Too many routes"
+
         # if all checks pass, return True
         return True
 
@@ -593,19 +643,17 @@ if __name__ == "__main__":
 
         max_steps = float("inf") if max_steps is None else max_steps
         actions = []
-        techs = []
         steps = 0
 
         while not td["done"].all():
             td = policy(td)
             actions.append(td["action"])
-            techs.append(td["current_tech"])
             td = env.step(td)["next"]
             steps += 1
             if steps > max_steps:
                 print("Max steps reached")
                 break
-        return torch.stack(actions, dim=1), torch.stack(techs, dim=1)
+        return torch.stack(actions, dim=1)
 
     # Simple heuristics (nearest neighbor + capacity check)
     def greedy_policy(td):
@@ -632,22 +680,50 @@ if __name__ == "__main__":
         td.set("action", action)
         return td
 
-    batch_size = 3
-
+    batch_size = 1
     env = SkillVRPEnv(batch_size=[batch_size])
 
-    td = env.reset()
+    feasible_rnd = []
+    feasible_greedy = []
 
-    actions_random, techs_random = rollout(env, td.clone(), random_policy)
-    actions_greedy, techs_greedy = rollout(env, td.clone(), greedy_policy)
+    reward_rnd = []
+    reward_greedy = []
 
     env.check_solution = False
+    for ii in range(1000):
+        td = env.reset()
+        # greedy
+        actions = rollout(env, td.clone(), greedy_policy)
+        reward = env.get_reward(td, actions)
+        reward_greedy.append(reward)
+        try:
+            feasible_greedy.append(
+                torch.full_like(reward, env.check_solution_validity(td, actions))
+            )
+        except AssertionError:
+            feasible_greedy.append(torch.full_like(reward, False))
 
-    reward_random = env.get_reward(td, actions_random)
-    reward_greedy = env.get_reward(td, actions_greedy)
+        # random
+        actions = rollout(env, td.clone(), random_policy)
+        reward = env.get_reward(td, actions)
+        reward_rnd.append(reward)
+        try:
+            feasible_rnd.append(
+                torch.full_like(reward, env.check_solution_validity(td, actions))
+            )
+        except AssertionError:
+            feasible_rnd.append(torch.full_like(reward, False))
 
-    env.check_solution_validity(td, actions_random)
-    env.check_solution_validity(td, actions_greedy)
+    reward_rnd = torch.stack(reward_rnd)
+    reward_greedy = torch.stack(reward_greedy)
+    feasible_rnd = torch.stack(feasible_rnd)
+    feasible_greedy = torch.stack(feasible_greedy)
 
-    print("Reward random: ", reward_random)
-    print("Reward greedy: ", reward_greedy)
+    print("Random policy:")
+    print("Mean reward:", reward_rnd.mean().item())
+    print("Feasible solutions:", feasible_rnd.mean().item())
+
+    print("Greedy policy:")
+    print("Mean reward:", reward_greedy.mean().item())
+    print("Feasible solutions:", feasible_greedy.mean().item())
+    print()
