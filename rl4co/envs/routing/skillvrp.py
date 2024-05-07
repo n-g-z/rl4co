@@ -62,7 +62,7 @@ class Instance(BaseModel):
     min_loc: float = 0.0
     max_loc: float = 150.0
     min_skill: int = 1
-    max_skill: int = 10
+    max_skill: int = 1
     min_duration: int = 10
     max_duration: int = 30
     system_start_time: float = 0
@@ -300,7 +300,7 @@ class SkillVRPEnv(RL4COEnvBase):
 
         # (2) check time windows
         can_reach_in_time = (
-            td["current_time"] + dist <= td["time_windows"][..., 1]
+            td["current_time"][..., None] + dist <= td["time_windows"][..., 1]
         )  # I only need to start the service before the time window ends, not finish it.
 
         # (3) check if node has been visited
@@ -310,32 +310,55 @@ class SkillVRPEnv(RL4COEnvBase):
         can_visit = can_service & can_reach_in_time & ~visited
 
         # (5) mask depot
-        can_visit[:, 0] = ~((td["current_node"] == 0) & (can_visit[:, 1:].sum(-1) > 0))
-
+        last_tech = td["current_tech"] == td["techs"].size(0) - 1
+        can_visit[:, 0] = ~(
+            ((td["current_node"] == 0) | last_tech) & (can_visit[:, 1:].sum(-1) > 0)
+        )
         return can_visit
 
     def _step(self, td: TensorDict) -> torch.Tensor:
         """Step function for the Skill-VRP. If a technician returns to the depot, the next technician is sent out.
         The visited node is marked as visited. The reward is set to zero and the done flag is set if all nodes have been visited.
         """
-        current_node = td["action"]  # Add dimension for step
+        # (1) update current node
+        current_node = td["action"]
+        current_tech = td["current_tech"]
+        current_time = td["current_time"]
 
+        # (2) update time
+        dist = get_distance(
+            td["locs"][torch.arange(*td.batch_size), td["current_node"]],
+            td["locs"][torch.arange(*td.batch_size), current_node],
+        )
+        start_times = gather_by_index(td["time_windows"], td["action"], dim=1)[..., 0]
+        current_time = (torch.max(current_time + dist, start_times)) * (
+            current_node != 0  # reset at the depot
+        ).float()
+
+        # (3) update technician
         # if I go back to the depot, send out next technician
-        td["current_tech"] += (current_node == 0).int()
+        current_tech += (current_node == 0).int()
+        # start from first technician again if all technicians have been sent out
+        # INFO: these solutions are not valid, because the technician is not allowed to visit the depot again,
+        # they will need to be marked as invalid in check_solution_validity()
+        current_tech = current_tech * (current_tech < td["techs"].size(1)).int()
 
+        # (4) update visited
         # Add one dimension since we write a single value
         visited = td["visited"].scatter(-1, current_node[..., None], 1)
 
         # SECTION: get done
-        done = visited.sum(-2) == visited.size(-2)
+        done = visited.sum(-1) == visited.size(-1)
         reward = torch.zeros_like(done)
 
         td.update(
             {
                 "current_node": current_node,
-                "visited": visited,
-                "reward": reward,
+                "current_tech": current_tech,
+                "current_time": current_time,
                 "done": done,
+                "reward": reward,
+                "visited": visited,
             }
         )
         td.set("action_mask", self.get_action_mask(td))
@@ -363,7 +386,7 @@ class SkillVRPEnv(RL4COEnvBase):
                 "travel_cost": td["travel_cost"],
                 # reset others
                 "current_time": torch.zeros(
-                    *batch_size, 1, dtype=torch.float32, device=self.device
+                    (*batch_size,), dtype=torch.float32, device=self.device
                 ),
                 "current_node": torch.zeros(
                     size=(*batch_size,), dtype=torch.long, device=self.device
@@ -428,6 +451,7 @@ class SkillVRPEnv(RL4COEnvBase):
     def check_solution_validity(td: TensorDict, actions: torch.Tensor):
         """Check that solution is valid: nodes are not visited twice except depot and required skill levels are always met."""
         batch_size, graph_size = td["skills"].shape[0], td["skills"].shape[1]
+        graph_size -= 1  # remove depot
         sorted_pi = actions.data.sort(1).values
 
         # Sorting it should give all zeros at front and then 1...n
@@ -438,14 +462,9 @@ class SkillVRPEnv(RL4COEnvBase):
             == sorted_pi[:, -graph_size:]
         ).all() and (sorted_pi[:, :-graph_size] == 0).all(), "Invalid tour"
 
-        # make sure all required skill  levels are met
+        # make sure all required skill levels are met
         indices = torch.nonzero(actions == 0)
-        skills = torch.cat(
-            [torch.zeros(batch_size, 1, 1, device=td.device), td["skills"]], 1
-        )
-        skills_ordered = gather_by_index(skills, actions).reshape(
-            [batch_size, actions.size(-1), 1]
-        )
+        skills_ordered = gather_by_index(td["skills"], actions)
         batch = start = tech = 0
         for each in indices:
             if each[0] > batch:
@@ -456,6 +475,8 @@ class SkillVRPEnv(RL4COEnvBase):
             ).all(), "Skill level not met"
             start = each[1] + 1  # skip the depot
             tech += 1
+        # if all checks pass, return True
+        return True
 
     @staticmethod
     def render(
@@ -563,6 +584,7 @@ class SkillVRPEnv(RL4COEnvBase):
 
 
 if __name__ == "__main__":
+    from rl4co.utils.ops import get_distance_matrix
 
     def rollout(env, td, policy, max_steps: int = None):
         """Helper function to rollout a policy. Currently, TorchRL does not allow to step
@@ -571,34 +593,34 @@ if __name__ == "__main__":
 
         max_steps = float("inf") if max_steps is None else max_steps
         actions = []
+        techs = []
         steps = 0
 
         while not td["done"].all():
             td = policy(td)
             actions.append(td["action"])
+            techs.append(td["current_tech"])
             td = env.step(td)["next"]
             steps += 1
             if steps > max_steps:
                 print("Max steps reached")
                 break
-        return torch.stack(actions, dim=1)
+        return torch.stack(actions, dim=1), torch.stack(techs, dim=1)
 
     # Simple heuristics (nearest neighbor + capacity check)
     def greedy_policy(td):
         """Select closest available action"""
         available_actions = td["action_mask"]
         # distances
-        cost_matrix = td["cost_matrix"]
+        cost_matrix = get_distance_matrix(locs=td["locs"]).to(dtype=torch.float32)
         current_action = td["current_node"]
         idx_batch = torch.arange(cost_matrix.size(0))
         distances_next = cost_matrix[idx_batch, current_action]
         distances_next[~available_actions.bool()] = float("inf")
-        # do not select depot if some capacity is left
+        # do not select depot if other actions are available
         distances_next[:, 0] = (
-            float("inf") * (td["used_capacity_linehaul"] < td["vehicle_capacity"]).float()
-        ).squeeze(-1)
-        # # if sum of available actions is 0, select depot
-        # distances_next[available_actions.sum(-1) == 0, 0] = 0
+            float("inf") * (available_actions[:, 1:].sum(-1) > 0).float()
+        )
         action = torch.argmin(distances_next, dim=-1)
         td.set("action", action)
         return td
@@ -607,7 +629,6 @@ if __name__ == "__main__":
     def random_policy(td):
         """Helper function to select a random action from available actions"""
         action = torch.multinomial(td["action_mask"].float(), 1).squeeze(-1)
-        # print(action)
         td.set("action", action)
         return td
 
@@ -616,17 +637,17 @@ if __name__ == "__main__":
     env = SkillVRPEnv(batch_size=[batch_size])
 
     td = env.reset()
-    action_mask = env.get_action_mask(td)
-    print("action_mask: ", action_mask)
 
-    actions_random = rollout(env, td.clone(), random_policy)
-    actions = rollout(env, td.clone(), greedy_policy)
+    actions_random, techs_random = rollout(env, td.clone(), random_policy)
+    actions_greedy, techs_greedy = rollout(env, td.clone(), greedy_policy)
 
-    env.check_solution_validity(td, actions_random)
-    env.check_solution_validity(td, actions)
+    env.check_solution = False
 
     reward_random = env.get_reward(td, actions_random)
-    reward_greedy = env.get_reward(td, actions)
+    reward_greedy = env.get_reward(td, actions_greedy)
+
+    env.check_solution_validity(td, actions_random)
+    env.check_solution_validity(td, actions_greedy)
 
     print("Reward random: ", reward_random)
     print("Reward greedy: ", reward_greedy)
