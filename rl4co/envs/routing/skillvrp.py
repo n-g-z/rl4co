@@ -212,6 +212,7 @@ class SkillVRPEnv(RL4COEnvBase):
             size=(*batch_size, self.params.num_tech, self.params.num_ops),
             device=self.device,
         )
+
         travel_cost = torch.ones(*batch_size, self.params.num_tech, 1)
         # consider ops_mapping
         idx = 0
@@ -219,7 +220,11 @@ class SkillVRPEnv(RL4COEnvBase):
             techs[:, idx : idx + mapping[0], mapping[1] :] = 0
             travel_cost[:, idx : idx + mapping[0], :] = mapping[2]
             idx += mapping[0]
-
+        # shuffle the technicians skill types
+        for ii in range(len(techs)):
+            for jj in range(len(techs[ii])):
+                tech = techs[ii, jj]
+                techs[ii, jj] = tech[torch.randperm(tech.shape[-1])]
         max_skills = torch.max(
             techs, dim=1
         ).values  # this will be the maximum available to the customers
@@ -636,6 +641,7 @@ class SkillVRPEnv(RL4COEnvBase):
 if __name__ == "__main__":
     from rl4co.utils.ops import get_distance_matrix
 
+    ## --- Rollout and policies --- ##
     def rollout(env, td, policy, max_steps: int = None):
         """Helper function to rollout a policy. Currently, TorchRL does not allow to step
         over envs when done with `env.rollout()`. We need this because for environments that complete at different steps.
@@ -680,6 +686,9 @@ if __name__ == "__main__":
         td.set("action", action)
         return td
 
+    ## ---END Rollout and policies --- ##
+
+    ## --- Test for feasibility ratio --- ##
     batch_size = 1
     env = SkillVRPEnv(batch_size=[batch_size])
 
@@ -727,3 +736,25 @@ if __name__ == "__main__":
     print("Mean reward:", reward_greedy.mean().item())
     print("Feasible solutions:", feasible_greedy.mean().item())
     print()
+
+    ## --- END Test for feasibility ratio --- ##
+
+    ## --- Attention Model --- ##
+    from rl4co.models.zoo.am import AttentionModel
+    from rl4co.utils.trainer import RL4COTrainer
+
+    batch_size = 3
+    env = SkillVRPEnv(batch_size=[batch_size])
+    model = AttentionModel(
+        env, baseline="rollout", train_data_size=100_000, val_data_size=10_000
+    )
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    td_init = env.reset(batch_size=[batch_size]).to(device)
+    model = model.to(device)
+    out = model(td_init.clone(), phase="test", decode_type="greedy", return_actions=True)
+
+    # Plotting
+    print(f"Tour lengths: {[f'{-r.item():.2f}' for r in out['reward']]}")
+    for td, actions in zip(td_init, out["actions"].cpu()):
+        env.render(td, actions)
