@@ -34,6 +34,7 @@ class GraphAttentionEncoder(nn.Module):
         feed_forward_hidden: int = 512,
         init_embedding: nn.Module = None,
         sdpa_fn=None,
+        **kwargs,
     ):
         super(GraphAttentionEncoder, self).__init__()
 
@@ -42,7 +43,7 @@ class GraphAttentionEncoder(nn.Module):
         self.env_name = env_name
 
         self.init_embedding = (
-            env_init_embedding(self.env_name, {"embedding_dim": embedding_dim})
+            env_init_embedding(self.env_name, {"embedding_dim": embedding_dim, **kwargs})
             if init_embedding is None
             else init_embedding
         )

@@ -65,12 +65,13 @@ class AutoregressivePolicy(nn.Module):
         train_decode_type: str = "sampling",
         val_decode_type: str = "greedy",
         test_decode_type: str = "greedy",
+        init_embedding_kwargs: dict = {},
         **unused_kw,
     ):
         super(AutoregressivePolicy, self).__init__()
 
         if len(unused_kw) > 0:
-            log.warn(f"Unused kwargs: {unused_kw}")
+            log.warn(f"Potentially unused kwargs: {unused_kw}")
 
         if isinstance(env_name, RL4COEnvBase):
             env_name = env_name.name
@@ -86,6 +87,7 @@ class AutoregressivePolicy(nn.Module):
                 normalization=normalization,
                 init_embedding=init_embedding,
                 sdpa_fn=sdpa_fn,
+                **init_embedding_kwargs,
             )
         else:
             self.encoder = encoder
