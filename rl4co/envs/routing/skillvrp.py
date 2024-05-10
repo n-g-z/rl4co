@@ -312,9 +312,8 @@ class SkillVRPEnv(RL4COEnvBase):
         """
         batch_size = td["locs"].shape[0]
         dist = get_distance(
-            td["locs"][torch.arange(batch_size), td["current_node"]],
-            td["locs"].transpose(0, 1),
-        ).transpose(0, 1)
+            td["locs"][torch.arange(batch_size), td["current_node"], None], td["locs"]
+        )
 
         # (1) check skill level
         current_tech_skill = td["techs"][torch.arange(batch_size), td["current_tech"]]
@@ -689,7 +688,7 @@ if __name__ == "__main__":
     ## ---END Rollout and policies --- ##
 
     ## --- Test for feasibility ratio --- ##
-    batch_size = 1
+    batch_size = 3
     env = SkillVRPEnv(batch_size=[batch_size])
 
     feasible_rnd = []
@@ -699,7 +698,7 @@ if __name__ == "__main__":
     reward_greedy = []
 
     env.check_solution = False
-    for ii in range(1000):
+    for ii in range(1):
         td = env.reset()
         # greedy
         actions = rollout(env, td.clone(), greedy_policy)
@@ -745,16 +744,53 @@ if __name__ == "__main__":
 
     batch_size = 3
     env = SkillVRPEnv(batch_size=[batch_size])
-    model = AttentionModel(
-        env, baseline="rollout", train_data_size=100_000, val_data_size=10_000
-    )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     td_init = env.reset(batch_size=[batch_size]).to(device)
-    model = model.to(device)
+
+    num_skills = td_init["skills"].size(-1)
+
+    model = AttentionModel(
+        env,
+        baseline="rollout",
+        train_data_size=100_000,
+        val_data_size=10_000,
+        policy_kwargs={"init_embedding_kwargs": {"num_skills": num_skills}},
+    ).to(device)
+
     out = model(td_init.clone(), phase="test", decode_type="greedy", return_actions=True)
+
+    actions_untrained = out["actions"].cpu().detach()
+    rewards_untrained = out["reward"].cpu().detach()
 
     # Plotting
     print(f"Tour lengths: {[f'{-r.item():.2f}' for r in out['reward']]}")
     for td, actions in zip(td_init, out["actions"].cpu()):
         env.render(td, actions)
+
+    # Training
+    trainer = RL4COTrainer(
+        max_epochs=3,
+        accelerator="gpu",
+        devices=1,
+        logger=None,
+    )
+    trainer.fit(model)
+
+    # Testing
+    # Greedy rollouts over trained model (same states as previous plot)
+    model = model.to(device)
+    out = model(td_init.clone(), phase="test", decode_type="greedy", return_actions=True)
+    actions_trained = out["actions"].cpu().detach()
+
+    # Plotting
+    import matplotlib.pyplot as plt
+
+    for i, td in enumerate(td_init):
+        fig, axs = plt.subplots(1, 2, figsize=(11, 5))
+        env.render(td, actions_untrained[i], ax=axs[0])
+        env.render(td, actions_trained[i], ax=axs[1])
+        axs[0].set_title(f"Untrained | Cost = {-rewards_untrained[i].item():.3f}")
+        axs[1].set_title(
+            r"Trained $\pi_\theta$" + f"| Cost = {-out['reward'][i].item():.3f}"
+        )
