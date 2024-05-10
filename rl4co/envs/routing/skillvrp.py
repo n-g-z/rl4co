@@ -68,7 +68,7 @@ class Instance(BaseModel):
     system_start_time: float = 0
     system_end_time: float = 480
     # system parameters
-    penalty_term: Optional[float] = None
+    penalty_term: Optional[float] = 1000
     tw_ratio: float = 0.2
     # further definitions
     tech_mapping: List[Tuple[int, int, float]] = [
@@ -461,17 +461,21 @@ class SkillVRPEnv(RL4COEnvBase):
         travel_cost = torch.zeros_like(distances)
         current_tech = torch.zeros(batch_size, dtype=torch.int64, device=self.device)
         num_routes = torch.zeros(batch_size, dtype=torch.int64, device=self.device)
+        technicians = torch.arange(num_techs)
         for ii in range(distances.size(-1)):
+            is_tech = torch.isin(go_from[:, ii], technicians)
+            current_tech = is_tech * go_from[:, ii] + ~is_tech * current_tech
             travel_cost[:, ii] = td["travel_cost"][
                 torch.arange(batch_size), current_tech
             ].squeeze(-1)
-            current_tech += (go_to[:, ii] == 0).int()
-            current_tech = current_tech * (current_tech < num_techs).int()
             # count up num_routes if starting a new route (i.e. not staying at depot)
-            num_routes += (go_to[:, ii] == 0).int() * (go_from[:, ii] != 0).int()
+            num_routes += (
+                torch.isin(go_to[:, ii], technicians).int()
+                * (~torch.isin(go_from[:, ii], technicians)).int()
+            )
 
         # (3) penalty for invalid solutions
-        # too many routes (may include further scenarios later on)
+        # too many routes (may include further relaxations later on)
         if td["penalty_term"].isnan().any():
             penalty = torch.zeros_like(num_routes)
         else:
@@ -769,13 +773,14 @@ if __name__ == "__main__":
 
     ## --- END Test for feasibility ratio --- ##
 
-    # actions, reward = run_greedy(
-    #     env.reset(batch_size=[batch_size]).clone(), check_feasibility=False
-    # )
+    actions, reward = run_greedy(
+        env.reset(batch_size=[batch_size]).clone(), check_feasibility=False
+    )
 
     ## --- Attention Model --- ##
     from rl4co.models.zoo.am import AttentionModel
     from rl4co.utils.trainer import RL4COTrainer
+    from datetime import datetime as dt
 
     batch_size = 3
     env = SkillVRPEnv(batch_size=[batch_size])
@@ -800,6 +805,7 @@ if __name__ == "__main__":
 
     # Plotting
     print(f"Tour lengths: {[f'{-r.item():.2f}' for r in out['reward']]}")
+    print(f"For Actions (untrained): {actions_untrained}")
     for td, actions in zip(td_init, out["actions"].cpu()):
         env.render(td, actions)
 
@@ -810,13 +816,20 @@ if __name__ == "__main__":
         devices=1,
         logger=None,
     )
+    print("Start training...")
+    start = dt.now()
     trainer.fit(model)
+    print(f"Training took: {dt.now() - start}")
 
     # Testing
     # Greedy rollouts over trained model (same states as previous plot)
     model = model.to(device)
     out = model(td_init.clone(), phase="test", decode_type="greedy", return_actions=True)
     actions_trained = out["actions"].cpu().detach()
+
+    # Plotting
+    print(f"Tour lengths: {[f'{-r.item():.2f}' for r in out['reward']]}")
+    print(f"For Actions (untrained): {actions_untrained}")
 
     # Plotting
     import matplotlib.pyplot as plt
