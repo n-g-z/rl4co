@@ -154,34 +154,34 @@ class SkillVRPInitEmbedding(nn.Module):
         - skills: skill requirements of the customers
     """
 
-    def __init__(
-        self, embedding_dim, linear_bias=True, node_dim: int = 4, num_skills: int = 1
-    ):
+    def __init__(self, embedding_dim, linear_bias=True, node_dim: int = 4, num_skills=1):
         super(SkillVRPInitEmbedding, self).__init__()
         node_dim = node_dim + num_skills  # x, y, tw start, tw end, skill 1, ..., skill N
         self.init_embed = nn.Linear(node_dim, embedding_dim, linear_bias)
-        # depot embedding: x, y, tw start, tw end
-        self.init_embed_depot = nn.Linear(4, embedding_dim, linear_bias)
-        # travel cost, skill 1, ..., skill N
-        self.init_embed_techs = nn.Linear(1 + num_skills, embedding_dim, linear_bias)
+        # depot embedding: x, y, tw start, tw end, travel cost, skill 1, ..., skill N
+        self.init_embed_depot = nn.Linear(node_dim + 1, embedding_dim, linear_bias)
 
     def forward(self, td):
         # extract from td
-        depot, cities = td["locs"][:, :1, :], td["locs"][:, 1:, :]
-        skills = td["skills"][:, 1:, :]
+        num_techs = td["travel_cost"].size(1)
+        depots, cities = td["locs"][:, :num_techs, :], td["locs"][:, num_techs:, :]
+        tech_skills, cust_skills = (
+            td["skills"][:, :num_techs, :],
+            td["skills"][:, num_techs:, :],
+        )
         tw_depot, time_windows = (
-            td["time_windows"][..., :1, :],
-            td["time_windows"][..., 1:, :],
+            td["time_windows"][..., :num_techs, :],
+            td["time_windows"][..., num_techs:, :],
         )
+        travel_cost = td["travel_cost"]
         # embeddings
-        depot_embedding = self.init_embed_depot(torch.cat((depot, tw_depot), -1))
-        node_embeddings = self.init_embed(torch.cat((cities, time_windows, skills), -1))
-        tech_embeddings = self.init_embed_techs(
-            torch.cat((td["travel_cost"], td["techs"]), -1)
+        depot_embedding = self.init_embed_depot(
+            torch.cat((depots, tw_depot, travel_cost, tech_skills), dim=-1)
         )
-        # bring together
-        out = torch.cat((depot_embedding, node_embeddings, tech_embeddings), -2)
-        return out
+        node_embeddings = self.init_embed(
+            torch.cat((cities, time_windows, cust_skills), -1)
+        )
+        return torch.cat((depot_embedding, node_embeddings), -2)
 
 
 class PCTSPInitEmbedding(nn.Module):
