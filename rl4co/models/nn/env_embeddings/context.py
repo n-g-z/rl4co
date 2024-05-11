@@ -170,7 +170,7 @@ class VRPTWContext(VRPContext):
     def _state_embedding(self, embeddings, td):
         capacity = super()._state_embedding(embeddings, td)
         current_time = td["current_time"]
-        return torch.cat([capacity, current_time], -1)
+        return torch.stack([capacity, current_time], -1)
 
 
 class SkillVRPContext(EnvContext):
@@ -178,16 +178,20 @@ class SkillVRPContext(EnvContext):
     Project the following to the embedding space:
         - current node embedding
         - current technician
+        - current time
     """
 
-    def __init__(self, embedding_dim):
+    def __init__(self, embedding_dim, num_skills=1):
         super(SkillVRPContext, self).__init__(
-            embedding_dim=embedding_dim, step_context_dim=embedding_dim
+            embedding_dim=embedding_dim, step_context_dim=embedding_dim * 2 + 1
         )
 
-    def forward(self, embeddings, td):
-        cur_node_embedding = self._cur_node_embedding(embeddings, td).squeeze()
-        return self.project_context(cur_node_embedding)
+    def _state_embedding(self, embeddings, td):
+        current_tech = gather_by_index(
+            embeddings, td["current_tech"], squeeze=False
+        ).squeeze(1)
+        current_time = td["current_time"][..., None]
+        return torch.cat([current_tech, current_time], -1)
 
 
 class PCTSPContext(EnvContext):
